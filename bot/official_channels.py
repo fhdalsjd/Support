@@ -34,22 +34,28 @@ def ensure_official_channels_table() -> None:
 
 
 def _channel_username(value: str | None) -> str:
+    """Extract a public Telegram channel username from @name or a t.me/telegram.me link."""
     if not value:
         return ""
     value = value.strip()
     if value.startswith("@"):
-        username = value[1:].split("/")[0].split("?")[0].strip().lower()
+        username = value[1:].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0].strip().lower()
         return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
     if not value.startswith(("https://", "http://")):
         return ""
     parsed = urlparse(value)
-    if parsed.netloc.lower() not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+    host = parsed.netloc.lower().split(":", 1)[0]
+    if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
         return ""
     parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return ""
+    if parts[0].lower() in {"s", "c"}:
+        if parts[0].lower() == "c":
+            return ""
+        parts = parts[1:]
     if not parts or parts[0].startswith("+"):
         return ""
-    if parts[0].lower() == "s" and len(parts) >= 2:
-        parts = parts[1:]
     username = parts[0].lstrip("@").lower()
     return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
 
@@ -58,9 +64,19 @@ def is_official_channel(username: str | None) -> bool:
     key = _channel_username(username)
     if not key:
         return False
+
+    # The configured Hf Bot account/channel is always protected, independently
+    # of the admin-managed database list. This is the hard safety backstop.
+    official_bot = str(settings.official_bot_username or "").lstrip("@").lower()
+    if official_bot and key == official_bot:
+        return True
+
     ensure_official_channels_table()
     with engine.connect() as connection:
-        row = connection.execute(text("SELECT 1 FROM official_channels WHERE lower(username)=:username LIMIT 1"), {"username": key}).first()
+        row = connection.execute(
+            text("SELECT 1 FROM official_channels WHERE lower(username)=:username LIMIT 1"),
+            {"username": key},
+        ).first()
     if row:
         return True
     configured = {_channel_username(link) for link in settings.moderation_channel_links}
@@ -75,17 +91,21 @@ def _list_channels() -> list[tuple[int, str]]:
 
 
 async def official_channel_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reject official-channel post URLs immediately, before Telethon verification or monitoring starts."""
+    """Reject protected official-channel post URLs before any application/verification work."""
     message = update.effective_message
     user = update.effective_user
     if not message or not user or user.id in settings.admin_ids or not message.text:
         return
+
     value = message.text.strip()
-    if not value.startswith(("https://t.me/", "http://t.me/", "https://telegram.me/", "http://telegram.me/")):
-        return
     key = _channel_username(value)
-    if not key or not is_official_channel(key):
+    if not key:
         return
+    if not is_official_channel(key):
+        return
+
+    # This handler is registered in group -3, before the user ConversationHandler.
+    # Stop propagation so receive_post_link() cannot call Telethon/run_full_check().
     await message.reply_text(
         "🚫 <b>Official Channel Not Allowed</b>\n\n"
         "Please send your <b>real channel</b> post link.\n\n"
