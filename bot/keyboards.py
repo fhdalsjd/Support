@@ -1,18 +1,36 @@
-"""Reusable Telegram keyboards for users and administrators."""
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+"""Inline keyboards used by the user and admin interfaces."""
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["📢 Free Advertisement"],
-        ["📋 My Application", "ℹ️ Requirements"],
-        ["📞 Support"],
-    ],
-    resize_keyboard=True,
-)
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Free Advertisement", callback_data="user_apply")],
+            [
+                InlineKeyboardButton("📋 My Application", callback_data="user_application"),
+                InlineKeyboardButton("ℹ️ Requirements", callback_data="user_requirements"),
+            ],
+            [InlineKeyboardButton("💬 Contact Support", callback_data="user_support")],
+        ]
+    )
+
+
+MAIN_MENU = main_menu_keyboard()
 APPLY_ENTRY = InlineKeyboardMarkup(
-    [[InlineKeyboardButton("📢 Start Application", callback_data="apply_start")]]
+    [[InlineKeyboardButton("🚀 Start Application", callback_data="apply_start")]]
 )
+
+
+def user_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]]
+    )
+
+
+def user_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖️ Cancel", callback_data="user_cancel")]]
+    )
 
 
 def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarkup:
@@ -31,17 +49,24 @@ def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarku
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("↩️ Back to Control Center", callback_data="admin_center")]]
+        [[InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")]]
     )
 
 
 def admin_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [
-                InlineKeyboardButton("✅ Send Broadcast", callback_data="admin_broadcast_confirm"),
-                InlineKeyboardButton("✖️ Cancel", callback_data="admin_broadcast_cancel"),
-            ]
+            [InlineKeyboardButton("✅ Send Broadcast", callback_data="admin_broadcast_confirm")],
+            [InlineKeyboardButton("✖️ Cancel", callback_data="admin_broadcast_cancel")],
+        ]
+    )
+
+
+def admin_support_reply_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("💬 Reply to User", callback_data=f"admin_support_reply:{user_id}")],
+            [InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")],
         ]
     )
 
@@ -59,9 +84,9 @@ def admin_review_keyboard(application_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def admin_pending_list_keyboard(application_ids: list[int]) -> InlineKeyboardMarkup | None:
+def admin_pending_list_keyboard(application_ids: list[int]) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(f"Application #{app_id}", callback_data=f"admin_details:{app_id}")]
+        [InlineKeyboardButton(f"📄 Application #{app_id}", callback_data=f"admin_details:{app_id}")]
         for app_id in application_ids
     ]
     rows.append([InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")])
