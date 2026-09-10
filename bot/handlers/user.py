@@ -19,7 +19,7 @@ from ..database import (
     is_user_blocked,
     session_scope,
 )
-from ..keyboards import MAIN_MENU, REQUIREMENTS_CONFIRM, user_back_keyboard, user_cancel_keyboard
+from ..keyboards import MAIN_MENU, requirements_keyboard, user_back_keyboard, user_cancel_keyboard
 from ..models import ActivityScore, Application, ApplicationStatus
 from ..notifications import notify
 from ..telethon_client import ChannelNotAccessibleError, PostLinkError
@@ -31,22 +31,36 @@ WAITING_REQUIREMENTS_CONFIRMATION = 1
 WAITING_POST_LINK = 2
 WAITING_SUPPORT_MESSAGE = 3
 
-REQUIREMENTS_TEXT = (
-    "ℹ️ <b>Application Requirements</b>\n\n"
-    "Please read these requirements before applying:\n\n"
-    f"• <b>{settings.min_subscribers:,}+</b> subscribers\n"
-    f"• <b>{settings.min_average_views:,}+</b> average views per post\n"
-    "• Your channel must be public and accessible for verification\n"
-    "• Publish a qualifying post containing our official referral link\n"
-    f"• The referral post must reach <b>{settings.min_referral_views:,}+</b> views within <b>{settings.verification_hours} hours</b>\n\n"
-    "<b>መስፈርቶች</b> 🇪🇹\n"
-    f"• ቢያንስ <b>{settings.min_subscribers:,}</b> ተመዝጋቢዎች ያስፈልጋሉ።\n"
-    f"• በእያንዳንዱ ፖስት ቢያንስ <b>{settings.min_average_views:,}</b> አማካይ እይታዎች ያስፈልጋሉ።\n"
-    "• ቻናሉ ለማረጋገጫ ይፋዊ እና ተደራሽ መሆን አለበት።\n"
-    "• የማጣቀሻ ሊንኩን የያዘ ተገቢ ፖስት ማተም አለብዎት።\n"
-    f"• የማጣቀሻ ፖስቱ በ<b>{settings.verification_hours}</b> ሰዓታት ውስጥ <b>{settings.min_referral_views:,}</b>+ እይታዎች ማግኘት አለበት።\n\n"
-    "Please confirm that you have read and understood the requirements."
-)
+
+def _requirements_text(amharic: bool = False) -> str:
+    official_link = f"https://t.me/{settings.official_bot_username}"
+    if amharic:
+        return (
+            "📋 <b>የማስታወቂያ ማመልከቻ መስፈርቶች</b>\n\n"
+            "ማመልከቻ ከማስገባትዎ በፊት እባክዎ የሚከተሉትን ሁሉንም መስፈርቶች ያንብቡ፦\n\n"
+            f"👥 <b>{settings.min_subscribers:,}+</b> ተመዝጋቢዎች ሊኖሩ ይገባል።\n\n"
+            f"👀 በእያንዳንዱ post ቢያንስ <b>{settings.min_average_views:,}+</b> አማካይ views ሊኖሩ ይገባል።\n\n"
+            "🔗 ከ <b>Hf Bot</b> የእርስዎ referral link በቻናልዎ post ላይ ማድረግ አለብዎት።\n\n"
+            f"📈 Referral post በ<b>{settings.verification_hours} ሰዓታት</b> ውስጥ <b>{settings.min_referral_views:,}+</b> views ማግኘት አለበት።\n\n"
+            "🔗 <b>Show official bot link 👉</b>\n"
+            f"<a href=\"{official_link}\">{official_link}</a>\n\n"
+            "እባክዎ መስፈርቶቹን በጥንቃቄ ያንብቡ። ካነበቡ በኋላ የማረጋገጫ ቁልፉን ይጫኑ።"
+        )
+    return (
+        "📋 <b>Application Requirements</b>\n\n"
+        "Please read all requirements carefully before applying.\n\n"
+        f"👥 <b>{settings.min_subscribers:,}+</b> subscribers\n\n"
+        f"👀 At least <b>{settings.min_average_views:,}+</b> average views per post\n\n"
+        "🔗 You must publish your <b>Hf Bot referral link</b> in a post on your channel\n\n"
+        "🌐 Your channel must be public and accessible for verification\n\n"
+        f"📈 The referral post must reach <b>{settings.min_referral_views:,}+</b> views within <b>{settings.verification_hours} hours</b>\n\n"
+        "🔗 <b>Show official bot link 👉</b>\n"
+        f"<a href=\"{official_link}\">{official_link}</a>\n\n"
+        "After reading the requirements, confirm below to continue to the post-link step."
+    )
+
+
+REQUIREMENTS_TEXT = _requirements_text(False)
 
 WELCOME_TEXT = (
     "👋 <b>Welcome</b>\n\n"
@@ -100,9 +114,23 @@ async def show_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=user_back_keyboard())
+        await query.edit_message_text(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=requirements_keyboard(False))
     else:
-        await update.message.reply_text(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=user_back_keyboard())
+        await update.message.reply_text(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=requirements_keyboard(False))
+
+
+async def requirements_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    if _blocked(update.effective_user.id):
+        await query.edit_message_text(BLOCKED_TEXT, parse_mode="HTML")
+        return
+    amharic = query.data == "requirements_amharic"
+    await query.edit_message_text(
+        _requirements_text(amharic),
+        parse_mode="HTML",
+        reply_markup=requirements_keyboard(amharic),
+    )
 
 
 async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -136,15 +164,8 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
     if not settings.admin_ids:
         await update.message.reply_text("⚠️ <b>Support temporarily unavailable</b>\n\nPlease try again later.", parse_mode="HTML", reply_markup=MAIN_MENU)
         return ConversationHandler.END
-
     handle = f"@{user.username}" if user.username else "No username"
-    forward_text = (
-        "📩 <b>New Support Request</b>\n\n"
-        f"<b>User:</b> {html.escape(handle)}\n"
-        f"<b>Telegram ID:</b> <code>{user.id}</code>\n\n"
-        "<b>Message</b>\n"
-        f"{html.escape(message_text)}"
-    )
+    forward_text = "📩 <b>New Support Request</b>\n\n" f"<b>User:</b> {html.escape(handle)}\n" f"<b>Telegram ID:</b> <code>{user.id}</code>\n\n<b>Message</b>\n{html.escape(message_text)}"
     from ..keyboards import admin_support_reply_keyboard
     delivered = 0
     for admin_id in settings.admin_ids:
@@ -247,19 +268,20 @@ async def apply_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         if existing is not None:
             await send("📋 <b>Application already in progress</b>\n\n" + _status_text(existing), parse_mode="HTML", reply_markup=user_back_keyboard())
             return ConversationHandler.END
-    await send(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=REQUIREMENTS_CONFIRM)
+    await send(REQUIREMENTS_TEXT, parse_mode="HTML", reply_markup=requirements_keyboard(False))
     return WAITING_REQUIREMENTS_CONFIRMATION
 
 
 async def requirements_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
+    await query.answer("Requirements confirmed")
     if _blocked(update.effective_user.id):
         await query.edit_message_text(BLOCKED_TEXT, parse_mode="HTML")
         return ConversationHandler.END
     await query.edit_message_text(
-        "✅ <b>Requirements confirmed</b>\n\n"
-        "Thank you. Now send the <b>public Telegram post link</b> that contains the required referral link.\n\n"
+        "🔗 <b>Post Link Required</b>\n\n"
+        "Thank you for confirming that you have read the requirements.\n\n"
+        "Now send the <b>public Telegram channel post link</b> where you published your Hf Bot referral link.\n\n"
         "🔗 Example: <code>https://t.me/channel/123</code>",
         parse_mode="HTML",
         reply_markup=user_cancel_keyboard(),
@@ -328,8 +350,8 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     with session_scope() as session:
         if _is_moderation_channel(result.channel.username):
             await update.message.reply_text(
-                "❌ <b>Application declined</b>\n\n"
-                "This channel is listed as an administrator-owned/moderation channel and cannot be submitted for promotion through this application flow.\n\n"
+                "❌ <b>Application Declined</b>\n\n"
+                "This channel is configured as an administrator/moderation channel and is not eligible for promotion through this application flow.\n\n"
                 "Please submit a different qualifying channel.",
                 parse_mode="HTML",
                 reply_markup=MAIN_MENU,
@@ -343,13 +365,13 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text("⚠️ <b>Channel already has an active application</b>\n\nPlease wait for the existing application to finish.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if not result.subscriber_ok:
-            await update.message.reply_text("❌ <b>Subscriber requirement not met</b>\n\n" f"Current: <b>{result.channel.subscriber_count:,}</b>\n" f"Required: <b>{settings.min_subscribers:,}</b>\n\n" "Please apply again once the requirement is met.", parse_mode="HTML", reply_markup=MAIN_MENU)
+            await update.message.reply_text("❌ <b>Subscriber requirement not met</b>\n\n" f"Current: <b>{result.channel.subscriber_count:,}</b>\n" f"Required: <b>{settings.min_subscribers:,}</b>\n\nPlease apply again once the requirement is met.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if not result.average_views_ok:
-            await update.message.reply_text("❌ <b>Average views requirement not met</b>\n\n" f"Current average: <b>{result.average_views:.0f}</b>\n" f"Required average: <b>{settings.min_average_views:,}</b>\n\n" "Please apply again once the requirement is met.", parse_mode="HTML", reply_markup=MAIN_MENU)
+            await update.message.reply_text("❌ <b>Average views requirement not met</b>\n\n" f"Current average: <b>{result.average_views:.0f}</b>\n" f"Required: <b>{settings.min_average_views:,}</b>\n\nPlease apply again once the requirement is met.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if not result.referral_link_ok:
-            await update.message.reply_text("❌ <b>Referral link not found</b>\n\n" "We could not find the official referral link in the submitted post.\n\n" f"The post must contain a link beginning with <code>{html.escape(settings.referral_url_prefix)}</code>.", parse_mode="HTML", reply_markup=MAIN_MENU)
+            await update.message.reply_text("❌ <b>Referral link not found</b>\n\n" "We could not find the official Hf Bot referral link in the submitted post.\n\n" f"The post must contain a link beginning with <code>{html.escape(settings.referral_url_prefix)}</code>.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
 
         deadline = datetime.utcnow() + timedelta(hours=settings.verification_hours)
@@ -395,6 +417,7 @@ def build_apply_conversation() -> ConversationHandler:
         entry_points=[CommandHandler("apply", apply_entry), CallbackQueryHandler(apply_entry, pattern=r"^(?:apply_start|user_apply)$")],
         states={
             WAITING_REQUIREMENTS_CONFIRMATION: [
+                CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"),
                 CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"),
                 CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"),
                 CommandHandler("cancel", cancel_conversation),
@@ -432,4 +455,5 @@ def register(application) -> None:
     application.add_handler(CallbackQueryHandler(home_callback, pattern=r"^user_home$"))
     application.add_handler(CallbackQueryHandler(my_application, pattern=r"^user_application$"))
     application.add_handler(CallbackQueryHandler(show_requirements, pattern=r"^user_requirements$"))
+    application.add_handler(CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"))
     application.add_handler(CommandHandler("myapplication", my_application))
