@@ -41,7 +41,10 @@ def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarku
 
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")]])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛡️ Official Channel Auto-Decline", callback_data="admin_settings")],
+        [InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")],
+    ])
 
 
 def admin_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
