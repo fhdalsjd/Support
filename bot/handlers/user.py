@@ -24,12 +24,7 @@ from ..database import (
     is_channel_already_approved,
     session_scope,
 )
-from ..keyboards import (
-    APPLY_ENTRY,
-    MAIN_MENU,
-    user_back_keyboard,
-    user_cancel_keyboard,
-)
+from ..keyboards import MAIN_MENU, user_back_keyboard, user_cancel_keyboard
 from ..models import ActivityScore, Application, ApplicationStatus
 from ..notifications import notify
 from ..telethon_client import ChannelNotAccessibleError, PostLinkError
@@ -78,11 +73,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             update.effective_user.username,
             update.effective_user.first_name,
         )
-    await update.message.reply_text(
-        WELCOME_TEXT,
-        parse_mode="HTML",
-        reply_markup=MAIN_MENU,
-    )
+    await update.message.reply_text(WELCOME_TEXT, parse_mode="HTML", reply_markup=MAIN_MENU)
 
 
 async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -92,20 +83,13 @@ async def home_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def show_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = REQUIREMENTS_TEXT
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text(
-            REQUIREMENTS_TEXT,
-            parse_mode="HTML",
-            reply_markup=user_back_keyboard(),
-        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=user_back_keyboard())
     else:
-        await update.message.reply_text(
-            REQUIREMENTS_TEXT,
-            parse_mode="HTML",
-            reply_markup=user_back_keyboard(),
-        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=user_back_keyboard())
 
 
 async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -118,17 +102,9 @@ async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if update.callback_query:
         query = update.callback_query
         await query.answer()
-        await query.edit_message_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=user_cancel_keyboard(),
-        )
+        await query.edit_message_text(text, parse_mode="HTML", reply_markup=user_cancel_keyboard())
     else:
-        await update.message.reply_text(
-            text,
-            parse_mode="HTML",
-            reply_markup=user_cancel_keyboard(),
-        )
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=user_cancel_keyboard())
     return WAITING_SUPPORT_MESSAGE
 
 
@@ -160,6 +136,8 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
         f"{html.escape(message_text)}"
     )
 
+    from ..keyboards import admin_support_reply_keyboard
+
     delivered = 0
     for admin_id in settings.admin_ids:
         try:
@@ -167,7 +145,7 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
                 chat_id=admin_id,
                 text=forward_text,
                 parse_mode="HTML",
-                reply_markup=__import__("bot.keyboards", fromlist=["admin_support_reply_keyboard"]).admin_support_reply_keyboard(user.id),
+                reply_markup=admin_support_reply_keyboard(user.id),
             )
             delivered += 1
         except Exception:
@@ -466,12 +444,7 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         session.flush()
 
         await notify(context, application, "received")
-        await notify(
-            context,
-            application,
-            "post_check_passed",
-            hours=settings.verification_hours,
-        )
+        await notify(context, application, "post_check_passed", hours=settings.verification_hours)
 
     await update.message.reply_text(
         "🎯 <b>Application accepted for verification</b>\n\n"
@@ -536,8 +509,4 @@ def register(application) -> None:
     application.add_handler(CallbackQueryHandler(home_callback, pattern=r"^user_home$"))
     application.add_handler(CallbackQueryHandler(my_application, pattern=r"^user_application$"))
     application.add_handler(CallbackQueryHandler(show_requirements, pattern=r"^user_requirements$"))
-    application.add_handler(MessageHandler(filters.Regex(r"^📢 Free Advertisement$"), apply_entry))
-    application.add_handler(MessageHandler(filters.Regex(r"^📋 My Application$"), my_application))
-    application.add_handler(MessageHandler(filters.Regex(r"^ℹ️ Requirements$"), show_requirements))
-    application.add_handler(MessageHandler(filters.Regex(r"^📞 Support$"), support_entry))
     application.add_handler(CommandHandler("myapplication", my_application))
