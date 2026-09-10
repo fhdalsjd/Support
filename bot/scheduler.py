@@ -4,6 +4,7 @@ Background polling job for the 24-hour referral-post view requirement.
 Runs on a fixed interval (TRACKING_POLL_MINUTES) and, for every
 application currently in TRACKING_VIEWS:
 
+  * NEVER monitors an administrator-protected official channel
   * re-fetches the SAME post (never a different one -- section 8/9)
   * updates current_views
   * if it has become unavailable -> FAILED, notify, stop tracking
@@ -31,6 +32,7 @@ from .database import get_applications_in_tracking, session_scope
 from .models import ApplicationStatus
 from .notifications import notify
 from .telethon_client import ChannelNotAccessibleError, inspector
+from . import official_channels
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +65,15 @@ async def _poll_one(context: _BotContext, application_id: int) -> None:
     with session_scope() as session:
         app = session.get(Application, application_id)
         if app is None or app.status != ApplicationStatus.TRACKING_VIEWS:
+            return
+
+        # HARD SAFETY NET: an official channel from the admin-protected list
+        # must NEVER be monitored, even if an old/bad application slipped into
+        # TRACKING_VIEWS before the submission-only check was added.
+        if official_channels.is_official_channel(app.channel_username):
+            app.status = ApplicationStatus.REJECTED
+            app.rejection_reason = "Official channel is protected and cannot be used for applications."
+            logger.warning("Stopped tracking protected official channel for application %s: %s", application_id, app.channel_username)
             return
 
         try:
