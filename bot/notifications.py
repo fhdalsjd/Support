@@ -6,6 +6,7 @@ import logging
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
+from .keyboards import main_menu_keyboard
 from .models import Application
 
 logger = logging.getLogger(__name__)
@@ -95,6 +96,7 @@ async def notify(
             chat_id=application.user_id,
             text=text,
             parse_mode="HTML",
+            reply_markup=main_menu_keyboard(),
         )
     except TelegramError as exc:
         logger.warning(
