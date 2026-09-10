@@ -42,7 +42,7 @@ def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarku
 
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🛡️ Official Channel Auto-Decline", callback_data="admin_settings")],
+        [InlineKeyboardButton("🛡️ Official Channel Auto-Decline", callback_data="admin_official_channels")],
         [InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")],
     ])
 
@@ -83,3 +83,14 @@ def admin_pending_list_keyboard(application_ids: list[int]) -> InlineKeyboardMar
     rows = [[InlineKeyboardButton(f"📄 Application #{app_id}", callback_data=f"admin_details:{app_id}")] for app_id in application_ids]
     rows.append([InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")])
     return InlineKeyboardMarkup(rows)
+
+
+def official_channels_keyboard(channels: list[tuple[int, str]]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"➖ @{username}", callback_data=f"official_channel_remove:{channel_id}")] for channel_id, username in channels]
+    rows.append([InlineKeyboardButton("➕ Add Official Channel", callback_data="official_channel_add")])
+    rows.append([InlineKeyboardButton("↩️ Back to Settings", callback_data="admin_settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def official_channel_cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="official_channel_cancel")]])
