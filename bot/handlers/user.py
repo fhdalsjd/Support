@@ -42,7 +42,7 @@ def _requirements_text(amharic: bool = False) -> str:
             f"👀 በእያንዳንዱ post ቢያንስ <b>{settings.min_average_views:,}+</b> አማካይ views ሊኖሩ ይገባል።\n\n"
             "🔗 ከ <b>Hf Bot</b> የእርስዎ referral link በቻናልዎ post ላይ ማድረግ አለብዎት።\n\n"
             f"📈 Referral post በ<b>{settings.verification_hours} ሰዓታት</b> ውስጥ <b>{settings.min_referral_views:,}+</b> views ማግኘት አለበት።\n\n"
-            "🔗 <b>Show official bot link 👉</b>\n"
+            "🔗 <b>Bot link 👇</b>\n"
             f"<a href=\"{official_link}\">{official_link}</a>\n\n"
             "እባክዎ መስፈርቶቹን በጥንቃቄ ያንብቡ። ካነበቡ በኋላ የማረጋገጫ ቁልፉን ይጫኑ።"
         )
@@ -54,7 +54,7 @@ def _requirements_text(amharic: bool = False) -> str:
         "🔗 You must publish your <b>Hf Bot referral link</b> in a post on your channel\n\n"
         "🌐 Your channel must be public and accessible for verification\n\n"
         f"📈 The referral post must reach <b>{settings.min_referral_views:,}+</b> views within <b>{settings.verification_hours} hours</b>\n\n"
-        "🔗 <b>Show official bot link 👉</b>\n"
+        "🔗 <b>Bot link 👇</b>\n"
         f"<a href=\"{official_link}\">{official_link}</a>\n\n"
         "After reading the requirements, confirm below to continue to the post-link step."
     )
@@ -126,11 +126,7 @@ async def requirements_language(update: Update, context: ContextTypes.DEFAULT_TY
         await query.edit_message_text(BLOCKED_TEXT, parse_mode="HTML")
         return
     amharic = query.data == "requirements_amharic"
-    await query.edit_message_text(
-        _requirements_text(amharic),
-        parse_mode="HTML",
-        reply_markup=requirements_keyboard(amharic),
-    )
+    await query.edit_message_text(_requirements_text(amharic), parse_mode="HTML", reply_markup=requirements_keyboard(amharic))
 
 
 async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
