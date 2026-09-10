@@ -24,6 +24,7 @@ from ..models import ActivityScore, Application, ApplicationStatus
 from ..notifications import notify
 from ..telethon_client import ChannelNotAccessibleError, PostLinkError
 from ..verification import run_full_check
+from .. import official_channels
 
 logger = logging.getLogger(__name__)
 
@@ -295,6 +296,28 @@ def _channel_key(value: str | None) -> str:
     return value.lstrip("@").split("/")[0].lower()
 
 
+def _submitted_channel_key(post_url: str) -> str:
+    """Extract the public channel username from a submitted Telegram post URL."""
+    try:
+        parsed = urlparse(post_url.strip())
+    except ValueError:
+        return ""
+    host = (parsed.netloc or "").lower().split(":", 1)[0]
+    if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
+        return ""
+    parts = [part for part in parsed.path.split("/") if part]
+    if not parts:
+        return ""
+    first = parts[0].lower()
+    if first == "s" and len(parts) >= 2:
+        return parts[1].lstrip("@").lower()
+    if first == "c":
+        return ""
+    if first.startswith("+") or first.startswith("joinchat"):
+        return ""
+    return parts[0].lstrip("@").lower()
+
+
 def _is_moderation_channel(username: str | None) -> bool:
     channel_key = _channel_key(username)
     if not channel_key:
@@ -312,6 +335,23 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if not post_url.startswith(("https://t.me/", "http://t.me/", "https://telegram.me/", "http://telegram.me/")):
         await update.message.reply_text("⚠️ <b>Invalid post link</b>\n\nPlease send a public Telegram channel post link.", parse_mode="HTML", reply_markup=user_cancel_keyboard())
         return WAITING_POST_LINK
+
+    # HARD FIRST-LINE PROTECTION: reject configured official/moderation channels
+    # before database checks, Telethon access, verification, application creation,
+    # or any view monitoring can start.
+    submitted_channel = _submitted_channel_key(post_url)
+    if submitted_channel and official_channels.is_official_channel(submitted_channel):
+        logger.warning("Blocked official channel submission before verification: %s", submitted_channel)
+        await update.message.reply_text(
+            "🚫 <b>Official Channel Not Allowed</b>\n\n"
+            "Please send your <b>real channel</b> post link.\n\n"
+            "❌ Please do not send <b>Hf Bot official channels</b> or other protected official channels.\n\n"
+            "⚠️ <b>You may be banned for violating this rule.</b>\n\n"
+            "Send a post link from your own qualifying channel to continue.",
+            parse_mode="HTML",
+            reply_markup=MAIN_MENU,
+        )
+        return ConversationHandler.END
 
     with session_scope() as session:
         db_user = get_or_create_user(session, user.id, user.username, user.first_name)
@@ -448,8 +488,3 @@ def register(application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(build_apply_conversation())
     application.add_handler(build_support_conversation())
-    application.add_handler(CallbackQueryHandler(home_callback, pattern=r"^user_home$"))
-    application.add_handler(CallbackQueryHandler(my_application, pattern=r"^user_application$"))
-    application.add_handler(CallbackQueryHandler(show_requirements, pattern=r"^user_requirements$"))
-    application.add_handler(CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"))
-    application.add_handler(CommandHandler("myapplication", my_application))
