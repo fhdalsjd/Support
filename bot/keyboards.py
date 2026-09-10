@@ -11,6 +11,11 @@ MAIN_MENU = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    """Compatibility helper for existing notification code."""
+    return MAIN_MENU
+
 APPLY_ENTRY = InlineKeyboardMarkup(
     [[InlineKeyboardButton("📢 Apply for Free Advertisement", callback_data="apply_start")]]
 )
