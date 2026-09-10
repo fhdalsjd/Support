@@ -269,39 +269,16 @@ def _channel_key(value: str | None) -> str:
         return ""
     value = value.strip()
     if "://" in value:
-        path = urlparse(value).path.strip("/")
-        return path.split("/")[0].lstrip("@").lower()
+        parsed = urlparse(value)
+        return parsed.path.strip("/").split("/")[0].lstrip("@").lower()
     return value.lstrip("@").split("/")[0].lower()
-
-
-def _submitted_channel_key(post_url: str) -> str:
-    """Extract the public channel username from a submitted Telegram post URL."""
-    try:
-        parsed = urlparse(post_url.strip())
-    except ValueError:
-        return ""
-    host = (parsed.netloc or "").lower().split(":", 1)[0]
-    if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
-        return ""
-    parts = [part for part in parsed.path.split("/") if part]
-    if not parts:
-        return ""
-    first = parts[0].lower()
-    if first == "s" and len(parts) >= 2:
-        return parts[1].lstrip("@").lower()
-    if first == "c":
-        return ""
-    if first.startswith("+") or first.startswith("joinchat"):
-        return ""
-    return parts[0].lstrip("@").lower()
 
 
 def _is_moderation_channel(username: str | None) -> bool:
     channel_key = _channel_key(username)
     if not channel_key:
         return False
-    configured = {_channel_key(link) for link in settings.moderation_channel_links}
-    return channel_key in configured
+    return official_channels.is_official_channel(channel_key)
 
 
 async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -309,20 +286,25 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if _blocked(user.id):
         await update.message.reply_text(BLOCKED_TEXT, parse_mode="HTML")
         return ConversationHandler.END
+
     post_url = update.message.text.strip()
     if not post_url.startswith(("https://t.me/", "http://t.me/", "https://telegram.me/", "http://telegram.me/")):
         await update.message.reply_text("⚠️ <b>Invalid post link</b>\n\nPlease send a public Telegram channel post link.", parse_mode="HTML", reply_markup=user_cancel_keyboard())
         return WAITING_POST_LINK
 
-    submitted_channel = _submitted_channel_key(post_url)
-    if submitted_channel and official_channels.is_official_channel(submitted_channel):
-        logger.warning("Blocked official channel submission before verification: %s", submitted_channel)
+    # ABSOLUTE FIRST APPLICATION CHECK:
+    # Match the submitted post URL against the exact admin-managed official-channel
+    # list/configuration BEFORE rate limits, DB application checks, referral checks,
+    # or any Telethon/verification work. Referral links can never make an official
+    # channel eligible.
+    if official_channels.is_official_post_url(post_url):
+        logger.warning("Declined protected official channel before monitoring: %s", post_url)
         await update.message.reply_text(
             "🚫 <b>Official Channel Not Allowed</b>\n\n"
-            "Please send your <b>real channel</b> post link.\n\n"
-            "❌ Please do not send <b>Hf Bot official channels</b> or other protected official channels.\n\n"
-            "⚠️ <b>You may be banned for violating this rule.</b>\n\n"
-            "Send a post link from your own qualifying channel to continue.",
+            "This channel is protected by the administrator and cannot be used for applications.\n\n"
+            "❌ Do not submit Hf Bot official channels or other channels saved in the Official Channel list.\n\n"
+            "⚠️ <b>Finding a referral link does not override this rule.</b>\n\n"
+            "Please send a post link from your own real, qualifying channel.",
             parse_mode="HTML",
             reply_markup=MAIN_MENU,
         )
@@ -359,8 +341,10 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return WAITING_POST_LINK
 
     with session_scope() as session:
+        # Defense in depth: if the URL parser could not identify the public username
+        # but Telegram verification did, still decline before any application is saved.
         if _is_moderation_channel(result.channel.username):
-            await update.message.reply_text("❌ <b>Application Declined</b>\n\nThis channel is configured as an administrator/moderation channel and is not eligible for promotion through this application flow.\n\nPlease submit a different qualifying channel.", parse_mode="HTML", reply_markup=MAIN_MENU)
+            await update.message.reply_text("🚫 <b>Official Channel Not Allowed</b>\n\nThis channel is protected by the administrator and is not eligible for promotion.\n\nPlease submit a different qualifying channel.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if is_channel_already_approved(session, result.channel.channel_id):
             await update.message.reply_text("ℹ️ <b>Channel already approved</b>\n\nThis channel is already part of the approved network.", parse_mode="HTML", reply_markup=MAIN_MENU)
@@ -389,33 +373,31 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             post_url=post_url,
             initial_views=result.post.views,
             current_views=result.post.views,
-            subscriber_count=result.channel.subscriber_count,
-            average_views=result.average_views,
-            activity_score=ActivityScore(result.activity_score),
-            activity_notes=result.activity_notes,
-            referral_link_found=True,
+            referral_link_ok=True,
+            subscriber_ok=result.subscriber_ok,
+            average_views_ok=result.average_views_ok,
             status=ApplicationStatus.TRACKING_VIEWS,
             verification_deadline=deadline,
+            last_checked_at=datetime.utcnow(),
         )
         session.add(application)
         db_user.last_applied_at = datetime.utcnow()
+        db_user.total_applications += 1
         session.flush()
-        await notify(context, application, "received")
-        await notify(context, application, "post_check_passed", hours=settings.verification_hours)
-
-    await update.message.reply_text("🎯 <b>Application accepted for verification</b>\n\n" f"Subscribers: <b>{result.channel.subscriber_count:,}</b>\n" f"Average views: <b>{result.average_views:.0f}</b>\n" "Referral link: <b>Verified</b> ✅\n\n" f"We are monitoring the post for <b>{settings.verification_hours} hours</b>. " f"It needs to reach <b>{settings.min_referral_views:,} views</b> to complete automatic verification.\n\n" "You can check your progress anytime from <b>My Application</b>.", parse_mode="HTML", reply_markup=MAIN_MENU)
+        notify("application_submitted", context, application=application, user=update.effective_user)
+        await update.message.reply_text("⏳ <b>Application accepted for verification</b>\n\nYour channel meets the initial requirements and the referral post is now being monitored.\n\nUse <b>My Application</b> to check progress.", parse_mode="HTML", reply_markup=MAIN_MENU)
     return ConversationHandler.END
-
-
-def build_apply_conversation() -> ConversationHandler:
-    return ConversationHandler(entry_points=[CommandHandler("apply", apply_entry), CallbackQueryHandler(apply_entry, pattern=r"^(?:apply_start|user_apply)$")], states={WAITING_REQUIREMENTS_CONFIRMATION: [CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"), CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"), CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], WAITING_POST_LINK: [CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_post_link)]}, fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], name="apply_conversation")
-
-
-def build_support_conversation() -> ConversationHandler:
-    return ConversationHandler(entry_points=[CommandHandler("support", support_entry), CallbackQueryHandler(support_entry, pattern=r"^user_support$")], states={WAITING_SUPPORT_MESSAGE: [CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message)]}, fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], name="support_conversation")
 
 
 def register(application) -> None:
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(build_apply_conversation())
-    application.add_handler(build_support_conversation())
+    application.add_handler(CallbackQueryHandler(home_callback, pattern=r"^home$"))
+    application.add_handler(CallbackQueryHandler(show_requirements, pattern=r"^requirements$"))
+    application.add_handler(CallbackQueryHandler(requirements_language, pattern=r"^requirements_(amharic|english)$"))
+    application.add_handler(CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"))
+    application.add_handler(CallbackQueryHandler(my_application, pattern=r"^my_application$"))
+    application.add_handler(CallbackQueryHandler(apply_entry, pattern=r"^apply$"))
+    application.add_handler(CallbackQueryHandler(support_entry, pattern=r"^support$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message), group=0)
+    application.add_handler(CommandHandler("cancel", cancel_conversation), group=0)
+    application.add_handler(ConversationHandler(entry_points=[CallbackQueryHandler(apply_entry, pattern=r"^apply$")], states={WAITING_REQUIREMENTS_CONFIRMATION: [CallbackQueryHandler(requirements_language, pattern=r"^requirements_(amharic|english)$"), CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"), CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$")], WAITING_POST_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_post_link), CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$")], WAITING_SUPPORT_MESSAGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message), CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$")]}, fallbacks=[CommandHandler("cancel", cancel_conversation)], name="user_flow")
