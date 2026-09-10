@@ -38,7 +38,7 @@ def _channel_username(value: str | None) -> str:
         return ""
     value = value.strip()
     if value.startswith("@"):
-        username = value[1:].split("/")[0].strip().lower()
+        username = value[1:].split("/")[0].split("?")[0].strip().lower()
         return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
     if not value.startswith(("https://", "http://")):
         return ""
@@ -48,6 +48,8 @@ def _channel_username(value: str | None) -> str:
     parts = [part for part in parsed.path.split("/") if part]
     if not parts or parts[0].startswith("+"):
         return ""
+    if parts[0].lower() == "s" and len(parts) >= 2:
+        parts = parts[1:]
     username = parts[0].lstrip("@").lower()
     return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
 
@@ -73,7 +75,7 @@ def _list_channels() -> list[tuple[int, str]]:
 
 
 async def official_channel_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reject submitted post URLs from saved official channels before application verification."""
+    """Reject official-channel post URLs immediately, before Telethon verification or monitoring starts."""
     message = update.effective_message
     user = update.effective_user
     if not message or not user or user.id in settings.admin_ids or not message.text:
@@ -199,7 +201,7 @@ def build_conversation() -> ConversationHandler:
 
 def register(application) -> None:
     ensure_official_channels_table()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, official_channel_guard), group=-2)
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, official_channel_guard), group=-3)
     application.add_handler(build_conversation())
     application.add_handler(CallbackQueryHandler(official_channels_page, pattern=r"^admin_official_channels$"))
     application.add_handler(CallbackQueryHandler(official_channel_remove, pattern=r"^official_channel_remove:\d+$"))
