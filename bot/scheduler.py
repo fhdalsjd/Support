@@ -81,8 +81,15 @@ async def _poll_one(context: _BotContext, application_id: int) -> None:
 
         if app.current_views >= settings.min_referral_views:
             app.status = ApplicationStatus.ADMIN_REVIEW
-            await notify(context, app, "views_goal_reached", views=app.current_views)
+            await notify(
+                context, app, "views_goal_reached",
+                views=app.current_views, required=settings.min_referral_views,
+            )
             await notify(context, app, "verification_passed")
+
+            from .handlers.admin import push_admin_review  # local import: avoids a cycle at module load
+
+            await push_admin_review(context, app)
             return
 
         if deadline and now >= deadline:
