@@ -61,12 +61,11 @@ def _channel_username(value: str | None) -> str:
 
 
 def is_official_channel(username: str | None) -> bool:
+    """Return True only when the channel is explicitly protected by configuration/admin list."""
     key = _channel_username(username)
     if not key:
         return False
 
-    # The configured Hf Bot account/channel is always protected, independently
-    # of the admin-managed database list. This is the hard safety backstop.
     official_bot = str(settings.official_bot_username or "").lstrip("@").lower()
     if official_bot and key == official_bot:
         return True
@@ -79,8 +78,15 @@ def is_official_channel(username: str | None) -> bool:
         ).first()
     if row:
         return True
+
     configured = {_channel_username(link) for link in settings.moderation_channel_links}
     return key in configured
+
+
+def is_official_post_url(post_url: str | None) -> bool:
+    """Hard pre-check for a submitted post URL; no Telegram/Telethon verification is performed."""
+    key = _channel_username(post_url)
+    return bool(key and is_official_channel(key))
 
 
 def _list_channels() -> list[tuple[int, str]]:
@@ -98,14 +104,9 @@ async def official_channel_guard(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     value = message.text.strip()
-    key = _channel_username(value)
-    if not key:
-        return
-    if not is_official_channel(key):
+    if not is_official_post_url(value):
         return
 
-    # This handler is registered in group -3, before the user ConversationHandler.
-    # Stop propagation so receive_post_link() cannot call Telethon/run_full_check().
     await message.reply_text(
         "🚫 <b>Official Channel Not Allowed</b>\n\n"
         "Please send your <b>real channel</b> post link.\n\n"
