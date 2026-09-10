@@ -23,7 +23,7 @@ from ..database import (
     is_channel_already_approved,
     session_scope,
 )
-from ..keyboards import APPLY_ENTRY, MAIN_MENU
+from ..keyboards import APPLY_ENTRY, MAIN_MENU, support_admin_keyboard
 from ..models import ActivityScore, Application, ApplicationStatus
 from ..notifications import notify
 from ..telethon_client import ChannelNotAccessibleError, PostLinkError
@@ -32,16 +32,19 @@ from ..verification import run_full_check
 logger = logging.getLogger(__name__)
 
 WAITING_POST_LINK = 1
+WAITING_SUPPORT_MESSAGE = 2
 
 REQUIREMENTS_TEXT = (
-    "ℹ️ <b>Eligibility requirements</b>\n\n"
+    "ℹ️ <b>Eligibility Requirements</b>\n\n"
+    "To qualify for free advertising, your channel needs to meet all of "
+    "the following:\n\n"
     f"• {settings.min_subscribers:,}+ subscribers\n"
     f"• {settings.min_average_views}+ average views per post\n"
-    "• A post publishing our official Mini App referral link\n"
+    "• A post featuring our official Mini App referral link\n"
     f"• That same post must reach {settings.min_referral_views}+ views "
     f"within {settings.verification_hours} hours\n\n"
-    "Send your channel post link (e.g. https://t.me/channelname/123) "
-    "once it's ready."
+    "Once you're ready, send us your channel post link "
+    "(e.g. https://t.me/channelname/123)."
 )
 
 
@@ -55,13 +58,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     await update.message.reply_text(
         "🎁 <b>Free Advertisement</b>\n\n"
-        "Promote your channel by advertising our Mini App for free -- once "
-        "your channel is verified and approved.",
+        "Get your channel featured for free by promoting our Mini App. "
+        "Once your channel passes verification and is approved, you're all set.",
         parse_mode="HTML",
         reply_markup=MAIN_MENU,
     )
     await update.message.reply_text(
-        "Tap below to get started.", reply_markup=APPLY_ENTRY
+        "Tap below whenever you're ready to apply.", reply_markup=APPLY_ENTRY
     )
 
 
@@ -69,13 +72,49 @@ async def show_requirements(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(REQUIREMENTS_TEXT, parse_mode="HTML")
 
 
-async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        "📞 <b>Support</b>\n\nHaving trouble with your application? "
-        "Contact an admin and mention your Telegram ID: "
-        f"<code>{update.effective_user.id}</code>",
+        "📞 <b>Support</b>\n\n"
+        "Please let us know what you need help with, and a member of our "
+        "team will get back to you here shortly.",
         parse_mode="HTML",
     )
+    return WAITING_SUPPORT_MESSAGE
+
+
+async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    message_text = update.message.text.strip()
+
+    if not settings.admin_ids:
+        await update.message.reply_text(
+            "Support is temporarily unavailable. Please try again later."
+        )
+        return ConversationHandler.END
+
+    handle = f"@{user.username}" if user.username else "(no username set)"
+    forward_text = (
+        "📩 <b>New Support Message</b>\n\n"
+        f"From: {handle}\n"
+        f"Telegram ID: <code>{user.id}</code>\n\n"
+        f"{message_text}"
+    )
+    for admin_id in settings.admin_ids:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                forward_text,
+                parse_mode="HTML",
+                reply_markup=support_admin_keyboard(user.id),
+            )
+        except Exception:
+            logger.exception("Failed to forward support message to admin %s", admin_id)
+
+    await update.message.reply_text(
+        "✅ Thank you — your message has been forwarded to our support team. "
+        "We'll get back to you here shortly."
+    )
+    return ConversationHandler.END
 
 
 def _format_time_remaining(deadline: datetime) -> str:
@@ -87,12 +126,24 @@ def _format_time_remaining(deadline: datetime) -> str:
     return f"{hours}h {minutes}m"
 
 
+STATUS_LABELS = {
+    ApplicationStatus.PENDING_POST_CHECK: "Checking your post…",
+    ApplicationStatus.TRACKING_VIEWS: "Tracking views",
+    ApplicationStatus.VERIFICATION_PASSED: "Verification passed",
+    ApplicationStatus.ADMIN_REVIEW: "Awaiting admin review",
+    ApplicationStatus.APPROVED: "Approved ✅",
+    ApplicationStatus.REJECTED: "Rejected ❌",
+    ApplicationStatus.EXPIRED: "Expired ⌛️",
+    ApplicationStatus.FAILED: "Failed ❌",
+}
+
+
 def _status_text(application: Application) -> str:
     lines = [
-        "📋 <b>Your application</b>",
+        "📋 <b>Your Application</b>",
         "",
         f"Channel: @{application.channel_username}",
-        f"Status: <b>{application.status.value}</b>",
+        f"Status: <b>{STATUS_LABELS.get(application.status, application.status.value)}</b>",
     ]
     if application.status == ApplicationStatus.TRACKING_VIEWS and application.verification_deadline:
         deadline = application.verification_deadline
@@ -110,8 +161,8 @@ async def my_application(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         application = get_user_active_application(session, update.effective_user.id)
         if application is None:
             await update.message.reply_text(
-                "You don't have an active application right now. "
-                "Tap 📢 Free Advertisement to apply."
+                "You don't currently have an active application. "
+                "Tap 📢 Free Advertisement whenever you're ready to apply."
             )
             return
         await update.message.reply_text(_status_text(application), parse_mode="HTML")
@@ -129,7 +180,8 @@ async def apply_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         existing = get_user_active_application(session, update.effective_user.id)
         if existing is not None:
             await send(
-                "You already have an application in progress:\n\n" + _status_text(existing),
+                "It looks like you already have an application in progress:\n\n"
+                + _status_text(existing),
                 parse_mode="HTML",
             )
             return ConversationHandler.END
@@ -149,20 +201,20 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             elapsed = (datetime.utcnow() - db_user.last_applied_at).total_seconds()
             if elapsed < settings.apply_rate_limit_seconds:
                 wait = int(settings.apply_rate_limit_seconds - elapsed)
-                await update.message.reply_text(f"Please wait {wait}s before submitting again.")
+                await update.message.reply_text(f"Please wait {wait} seconds before submitting again.")
                 return WAITING_POST_LINK
 
         user_active = get_user_active_application(session, user.id)
         if user_active is not None:
             if user_active.post_url == post_url:
                 await update.message.reply_text(
-                    "This post is already under verification -- the timer is "
-                    "not reset by resubmitting it.\n\n" + _status_text(user_active),
+                    "This post is already under verification. Resubmitting it "
+                    "does not reset the tracking timer.\n\n" + _status_text(user_active),
                     parse_mode="HTML",
                 )
                 return ConversationHandler.END
             await update.message.reply_text(
-                "You already have an active application in progress. "
+                "You currently have an active application in progress. "
                 "Please wait for it to finish before submitting a different post.\n\n"
                 + _status_text(user_active),
                 parse_mode="HTML",
@@ -187,14 +239,14 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception:
         logger.exception("Unexpected error verifying %s", post_url)
         await update.message.reply_text(
-            "❌ Something went wrong while checking that post. Please try again shortly."
+            "❌ Something went wrong while checking that post. Please try again in a few minutes."
         )
         return WAITING_POST_LINK
 
     with session_scope() as session:
         if is_channel_already_approved(session, result.channel.channel_id):
             await update.message.reply_text(
-                "ℹ️ This channel is already approved for free advertising -- no need to reapply."
+                "ℹ️ This channel is already approved for free advertising — no need to apply again."
             )
             return ConversationHandler.END
 
@@ -207,25 +259,29 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
         if not result.subscriber_ok:
             await update.message.reply_text(
-                f"❌ Subscriber requirement not met.\n\n"
+                "❌ <b>Subscriber Requirement Not Met</b>\n\n"
                 f"Your channel has {result.channel.subscriber_count:,} subscribers. "
-                f"A minimum of {settings.min_subscribers:,} is required."
+                f"A minimum of {settings.min_subscribers:,} is required.",
+                parse_mode="HTML",
             )
             return ConversationHandler.END
 
         if not result.average_views_ok:
             await update.message.reply_text(
-                f"❌ Average views requirement not met.\n\n"
-                f"Your channel's average is {result.average_views:.0f} views/post. "
-                f"A minimum of {settings.min_average_views} is required."
+                "❌ <b>Average Views Requirement Not Met</b>\n\n"
+                f"Your channel's average is {result.average_views:.0f} views per post. "
+                f"A minimum of {settings.min_average_views} is required.",
+                parse_mode="HTML",
             )
             return ConversationHandler.END
 
         if not result.referral_link_ok:
             await update.message.reply_text(
-                "❌ Official Mini App referral link not found in that post.\n\n"
+                "❌ <b>Referral Link Not Found</b>\n\n"
+                "We couldn't find our official Mini App referral link in that post. "
                 f"Please publish a post containing a link in the form "
-                f"{settings.referral_url_prefix}<id> and submit it here."
+                f"{settings.referral_url_prefix}&lt;id&gt; and submit it here.",
+                parse_mode="HTML",
             )
             return ConversationHandler.END
 
@@ -261,18 +317,20 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
 
     await update.message.reply_text(
-        f"✅ Eligible so far!\n\n"
+        "✅ <b>Eligible So Far!</b>\n\n"
         f"Subscribers: {result.channel.subscriber_count:,}\n"
         f"Average views: {result.average_views:.0f}\n"
-        f"Referral link: FOUND ✅\n\n"
-        f"Now tracking this post -- it needs {settings.min_referral_views}+ views "
-        f"within {settings.verification_hours} hours. Check 📋 My Application for progress."
+        f"Referral link: Found ✅\n\n"
+        f"We're now tracking this post — it needs {settings.min_referral_views}+ views "
+        f"within {settings.verification_hours} hours to complete verification. "
+        "You can check progress anytime under 📋 My Application.",
+        parse_mode="HTML",
     )
     return ConversationHandler.END
 
 
 async def cancel_apply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Cancelled. You can apply again anytime from the main menu.")
+    await update.message.reply_text("Cancelled — you can apply again anytime from the main menu.")
     return ConversationHandler.END
 
 
@@ -294,10 +352,27 @@ def build_apply_conversation() -> ConversationHandler:
     )
 
 
+def build_support_conversation() -> ConversationHandler:
+    return ConversationHandler(
+        entry_points=[
+            CommandHandler("support", support_entry),
+            MessageHandler(filters.Regex("^📞 Support$"), support_entry),
+        ],
+        states={
+            WAITING_SUPPORT_MESSAGE: [
+                CommandHandler("cancel", cancel_apply),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message),
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_apply)],
+        name="support_conversation",
+    )
+
+
 def register(application) -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(build_apply_conversation())
+    application.add_handler(build_support_conversation())
     application.add_handler(MessageHandler(filters.Regex("^📋 My Application$"), my_application))
     application.add_handler(CommandHandler("myapplication", my_application))
     application.add_handler(MessageHandler(filters.Regex("^ℹ️ Requirements$"), show_requirements))
-    application.add_handler(MessageHandler(filters.Regex("^📞 Support$"), show_support))
