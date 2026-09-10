@@ -62,19 +62,8 @@ def _requirements_text(amharic: bool = False) -> str:
 
 
 REQUIREMENTS_TEXT = _requirements_text(False)
-
-WELCOME_TEXT = (
-    "👋 <b>Welcome</b>\n\n"
-    "Apply for channel promotion through a simple verification process.\n\n"
-    "Your channel and qualifying post are checked automatically. If the requirements are met, the application is sent to the moderation team for final review.\n\n"
-    "Choose an option below to continue."
-)
-
-BLOCKED_TEXT = (
-    "🚫 <b>Access Restricted</b>\n\n"
-    "Your access to this bot has been restricted by the support team.\n\n"
-    "You cannot submit applications or use support while this restriction is active."
-)
+WELCOME_TEXT = ("👋 <b>Welcome</b>\n\n" "Apply for channel promotion through a simple verification process.\n\n" "Your channel and qualifying post are checked automatically. If the requirements are met, the application is sent to the moderation team for final review.\n\n" "Choose an option below to continue.")
+BLOCKED_TEXT = ("🚫 <b>Access Restricted</b>\n\n" "Your access to this bot has been restricted by the support team.\n\n" "You cannot submit applications or use support while this restriction is active.")
 
 
 def _menu_text() -> str:
@@ -135,11 +124,7 @@ async def support_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         if update.callback_query:
             await update.callback_query.answer("Access restricted.", show_alert=True)
         return ConversationHandler.END
-    text = (
-        "💬 <b>Contact Support</b>\n\n"
-        "Send your message below and our support team will review it.\n\n"
-        "Please keep messages respectful and include enough detail for us to help quickly."
-    )
+    text = ("💬 <b>Contact Support</b>\n\n" "Send your message below and our support team will review it.\n\n" "Please keep messages respectful and include enough detail for us to help quickly.")
     if update.callback_query:
         query = update.callback_query
         await query.answer()
@@ -275,14 +260,7 @@ async def requirements_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     if _blocked(update.effective_user.id):
         await query.edit_message_text(BLOCKED_TEXT, parse_mode="HTML")
         return ConversationHandler.END
-    await query.edit_message_text(
-        "🔗 <b>Post Link Required</b>\n\n"
-        "Thank you for confirming that you have read the requirements.\n\n"
-        "Now send the <b>public Telegram channel post link</b> where you published your Hf Bot referral link.\n\n"
-        "🔗 Example: <code>https://t.me/channel/123</code>",
-        parse_mode="HTML",
-        reply_markup=user_cancel_keyboard(),
-    )
+    await query.edit_message_text("🔗 <b>Post Link Required</b>\n\n" "Thank you for confirming that you have read the requirements.\n\n" "Now send the <b>public Telegram channel post link</b> where you published your Hf Bot referral link.\n\n" "🔗 Example: <code>https://t.me/channel/123</code>", parse_mode="HTML", reply_markup=user_cancel_keyboard())
     return WAITING_POST_LINK
 
 
@@ -336,9 +314,6 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("⚠️ <b>Invalid post link</b>\n\nPlease send a public Telegram channel post link.", parse_mode="HTML", reply_markup=user_cancel_keyboard())
         return WAITING_POST_LINK
 
-    # HARD FIRST-LINE PROTECTION: reject configured official/moderation channels
-    # before database checks, Telethon access, verification, application creation,
-    # or any view monitoring can start.
     submitted_channel = _submitted_channel_key(post_url)
     if submitted_channel and official_channels.is_official_channel(submitted_channel):
         logger.warning("Blocked official channel submission before verification: %s", submitted_channel)
@@ -385,13 +360,7 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     with session_scope() as session:
         if _is_moderation_channel(result.channel.username):
-            await update.message.reply_text(
-                "❌ <b>Application Declined</b>\n\n"
-                "This channel is configured as an administrator/moderation channel and is not eligible for promotion through this application flow.\n\n"
-                "Please submit a different qualifying channel.",
-                parse_mode="HTML",
-                reply_markup=MAIN_MENU,
-            )
+            await update.message.reply_text("❌ <b>Application Declined</b>\n\nThis channel is configured as an administrator/moderation channel and is not eligible for promotion through this application flow.\n\nPlease submit a different qualifying channel.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if is_channel_already_approved(session, result.channel.channel_id):
             await update.message.reply_text("ℹ️ <b>Channel already approved</b>\n\nThis channel is already part of the approved network.", parse_mode="HTML", reply_markup=MAIN_MENU)
@@ -407,7 +376,7 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             await update.message.reply_text("❌ <b>Average views requirement not met</b>\n\n" f"Current average: <b>{result.average_views:.0f}</b>\n" f"Required: <b>{settings.min_average_views:,}</b>\n\nPlease apply again once the requirement is met.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
         if not result.referral_link_ok:
-            await update.message.reply_text("❌ <b>Referral link not found</b>\n\n" "We could not find the official Hf Bot referral link in the submitted post.\n\n" f"The post must contain a link beginning with <code>{html.escape(settings.referral_url_prefix)}</code>.", parse_mode="HTML", reply_markup=MAIN_MENU)
+            await update.message.reply_text("❌ <b>Referral link not found</b>\n\nWe could not find the official Hf Bot referral link in the submitted post.\n\n" f"The post must contain a link beginning with <code>{html.escape(settings.referral_url_prefix)}</code>.", parse_mode="HTML", reply_markup=MAIN_MENU)
             return ConversationHandler.END
 
         deadline = datetime.utcnow() + timedelta(hours=settings.verification_hours)
@@ -434,54 +403,16 @@ async def receive_post_link(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await notify(context, application, "received")
         await notify(context, application, "post_check_passed", hours=settings.verification_hours)
 
-    await update.message.reply_text(
-        "🎯 <b>Application accepted for verification</b>\n\n"
-        f"Subscribers: <b>{result.channel.subscriber_count:,}</b>\n"
-        f"Average views: <b>{result.average_views:.0f}</b>\n"
-        "Referral link: <b>Verified</b> ✅\n\n"
-        f"We are monitoring the post for <b>{settings.verification_hours} hours</b>. "
-        f"It needs to reach <b>{settings.min_referral_views:,} views</b> to complete automatic verification.\n\n"
-        "You can check your progress anytime from <b>My Application</b>.",
-        parse_mode="HTML",
-        reply_markup=MAIN_MENU,
-    )
+    await update.message.reply_text("🎯 <b>Application accepted for verification</b>\n\n" f"Subscribers: <b>{result.channel.subscriber_count:,}</b>\n" f"Average views: <b>{result.average_views:.0f}</b>\n" "Referral link: <b>Verified</b> ✅\n\n" f"We are monitoring the post for <b>{settings.verification_hours} hours</b>. " f"It needs to reach <b>{settings.min_referral_views:,} views</b> to complete automatic verification.\n\n" "You can check your progress anytime from <b>My Application</b>.", parse_mode="HTML", reply_markup=MAIN_MENU)
     return ConversationHandler.END
 
 
 def build_apply_conversation() -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=[CommandHandler("apply", apply_entry), CallbackQueryHandler(apply_entry, pattern=r"^(?:apply_start|user_apply)$")],
-        states={
-            WAITING_REQUIREMENTS_CONFIRMATION: [
-                CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"),
-                CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"),
-                CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"),
-                CommandHandler("cancel", cancel_conversation),
-            ],
-            WAITING_POST_LINK: [
-                CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"),
-                CommandHandler("cancel", cancel_conversation),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_post_link),
-            ],
-        },
-        fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)],
-        name="apply_conversation",
-    )
+    return ConversationHandler(entry_points=[CommandHandler("apply", apply_entry), CallbackQueryHandler(apply_entry, pattern=r"^(?:apply_start|user_apply)$")], states={WAITING_REQUIREMENTS_CONFIRMATION: [CallbackQueryHandler(requirements_language, pattern=r"^requirements_(?:amharic|english)$"), CallbackQueryHandler(requirements_confirm, pattern=r"^requirements_confirm$"), CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], WAITING_POST_LINK: [CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_post_link)]}, fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], name="apply_conversation")
 
 
 def build_support_conversation() -> ConversationHandler:
-    return ConversationHandler(
-        entry_points=[CommandHandler("support", support_entry), CallbackQueryHandler(support_entry, pattern=r"^user_support$")],
-        states={
-            WAITING_SUPPORT_MESSAGE: [
-                CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"),
-                CommandHandler("cancel", cancel_conversation),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message),
-            ]
-        },
-        fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)],
-        name="support_conversation",
-    )
+    return ConversationHandler(entry_points=[CommandHandler("support", support_entry), CallbackQueryHandler(support_entry, pattern=r"^user_support$")], states={WAITING_SUPPORT_MESSAGE: [CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation), MessageHandler(filters.TEXT & ~filters.COMMAND, receive_support_message)]}, fallbacks=[CallbackQueryHandler(cancel_conversation, pattern=r"^user_cancel$"), CommandHandler("cancel", cancel_conversation)], name="support_conversation")
 
 
 def register(application) -> None:
