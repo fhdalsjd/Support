@@ -15,6 +15,11 @@ from .keyboards import admin_back_keyboard, official_channel_cancel_keyboard, of
 WAITING_OFFICIAL_CHANNEL = 40
 
 
+def _admin_allowed(update: Update) -> bool:
+    user = update.effective_user
+    return bool(user and user.id in settings.admin_ids)
+
+
 def ensure_official_channels_table() -> None:
     with engine.begin() as connection:
         connection.execute(text("""
@@ -33,7 +38,8 @@ def _channel_username(value: str | None) -> str:
         return ""
     value = value.strip()
     if value.startswith("@"):
-        return value[1:].split("/")[0].strip().lower()
+        username = value[1:].split("/")[0].strip().lower()
+        return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
     if not value.startswith(("https://", "http://")):
         return ""
     parsed = urlparse(value)
@@ -62,12 +68,15 @@ def is_official_channel(username: str | None) -> bool:
 def _list_channels() -> list[tuple[int, str]]:
     ensure_official_channels_table()
     with engine.connect() as connection:
-        rows = connection.execute(text("SELECT id, username FROM official_channels ORDER BY lower(username)" )).all()
+        rows = connection.execute(text("SELECT id, username FROM official_channels ORDER BY lower(username)")).all()
     return [(int(row[0]), str(row[1])) for row in rows]
 
 
 async def official_channels_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not _admin_allowed(update):
+        await query.answer("This area is restricted to administrators.", show_alert=True)
+        return
     await query.answer()
     channels = _list_channels()
     if channels:
@@ -86,6 +95,9 @@ async def official_channels_page(update: Update, context: ContextTypes.DEFAULT_T
 
 async def official_channel_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not _admin_allowed(update):
+        await query.answer("This area is restricted to administrators.", show_alert=True)
+        return ConversationHandler.END
     await query.answer("Send the official channel username or link.")
     await query.message.reply_text(
         "➕ <b>Add Official Channel</b>\n\n"
@@ -99,6 +111,8 @@ async def official_channel_add(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def official_channel_save(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _admin_allowed(update):
+        return ConversationHandler.END
     value = update.message.text.strip()
     username = _channel_username(value)
     if not username:
@@ -122,19 +136,22 @@ async def official_channel_save(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             f"ℹ️ <b>@{username}</b> is already saved.\n\nAutomatic decline is already active for this channel.",
             parse_mode="HTML",
-            reply_markup=admin_back_keyboard(),
+            reply_markup=official_channels_keyboard(_list_channels()),
         )
         return ConversationHandler.END
     await update.message.reply_text(
         f"✅ <b>Official channel saved</b>\n\n<b>@{username}</b> is now protected by automatic decline.\n\nApplications submitted from this channel will be declined automatically.",
         parse_mode="HTML",
-        reply_markup=admin_back_keyboard(),
+        reply_markup=official_channels_keyboard(_list_channels()),
     )
     return ConversationHandler.END
 
 
 async def official_channel_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not _admin_allowed(update):
+        await query.answer("This area is restricted to administrators.", show_alert=True)
+        return
     await query.answer()
     try:
         channel_id = int(query.data.split(":", 1)[1])
@@ -158,12 +175,17 @@ async def official_channel_remove(update: Update, context: ContextTypes.DEFAULT_
 
 async def official_channel_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    if not _admin_allowed(update):
+        await query.answer("This area is restricted to administrators.", show_alert=True)
+        return ConversationHandler.END
     await query.answer("Cancelled")
     await query.edit_message_text("🛡️ <b>Official Channel Auto-Decline</b>\n\nNo changes were made.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
     return ConversationHandler.END
 
 
 async def official_channel_cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not _admin_allowed(update):
+        return ConversationHandler.END
     await update.message.reply_text("Cancelled. No channel was added.", reply_markup=admin_back_keyboard())
     return ConversationHandler.END
 
