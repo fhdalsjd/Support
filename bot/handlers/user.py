@@ -23,7 +23,7 @@ from ..database import (
     is_channel_already_approved,
     session_scope,
 )
-from ..keyboards import APPLY_ENTRY, MAIN_MENU, support_admin_keyboard
+from ..keyboards import APPLY_ENTRY, MAIN_MENU
 from ..models import ActivityScore, Application, ApplicationStatus
 from ..notifications import notify
 from ..telethon_client import ChannelNotAccessibleError, PostLinkError
@@ -105,7 +105,6 @@ async def receive_support_message(update: Update, context: ContextTypes.DEFAULT_
                 admin_id,
                 forward_text,
                 parse_mode="HTML",
-                reply_markup=support_admin_keyboard(user.id),
             )
         except Exception:
             logger.exception("Failed to forward support message to admin %s", admin_id)
