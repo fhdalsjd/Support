@@ -1,0 +1,12 @@
+services:
+  ad-bot:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./sessions:/app/sessions
+    # If DATABASE_URL points at sqlite:///./data/bot.db (the default),
+    # the volume above makes the database persist across container restarts.
+    # Point DATABASE_URL at a real Postgres service instead for production.
