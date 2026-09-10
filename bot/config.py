@@ -34,6 +34,10 @@ def _parse_admin_ids(raw: str) -> set[int]:
     return ids
 
 
+def _parse_channel_links(raw: str) -> tuple[str, ...]:
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
 @dataclass(frozen=True)
 class Settings:
     bot_token: str
@@ -54,6 +58,7 @@ class Settings:
     average_views_sample_size: int
     tracking_poll_minutes: int
     apply_rate_limit_seconds: int
+    moderation_channel_links: tuple[str, ...]
 
     referral_url_prefix: str = field(init=False)
 
@@ -95,6 +100,7 @@ def load_settings() -> Settings:
         average_views_sample_size=int(os.environ.get("AVERAGE_VIEWS_SAMPLE_SIZE", 15)),
         tracking_poll_minutes=int(os.environ.get("TRACKING_POLL_MINUTES", 15)),
         apply_rate_limit_seconds=int(os.environ.get("APPLY_RATE_LIMIT_SECONDS", 30)),
+        moderation_channel_links=_parse_channel_links(os.environ.get("MODERATION_CHANNEL_LINKS", "")),
     )
 
 
