@@ -36,6 +36,10 @@ class User(Base):
     first_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     last_applied_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    blocked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    blocked_by: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    block_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     applications: Mapped[list["Application"]] = relationship(back_populates="user")
 
 
