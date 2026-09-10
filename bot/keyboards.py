@@ -1,24 +1,69 @@
-"""Reusable Telegram keyboards."""
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
-
-# Keep the original user-facing keyboard exactly as in the previous bot.
-MAIN_MENU = ReplyKeyboardMarkup(
-    [
-        ["📢 Free Advertisement"],
-        ["📋 My Application", "ℹ️ Requirements"],
-        ["📞 Support"],
-    ],
-    resize_keyboard=True,
-)
+"""Reusable Telegram inline keyboards."""
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
-    """Compatibility helper for existing notification code."""
-    return MAIN_MENU
+def main_menu_keyboard(amharic: bool = False) -> InlineKeyboardMarkup:
+    if amharic:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("📢 ነፃ ማስታወቂያ", callback_data="menu_apply")],
+                [
+                    InlineKeyboardButton("📋 ማመልከቻዬ", callback_data="menu_application"),
+                    InlineKeyboardButton("ℹ️ መስፈርቶች", callback_data="menu_requirements"),
+                ],
+                [InlineKeyboardButton("📞 ድጋፍ", callback_data="menu_support")],
+                [InlineKeyboardButton("🇬🇧 English", callback_data="language_english")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📢 Free Advertisement", callback_data="menu_apply")],
+            [
+                InlineKeyboardButton("📋 My Application", callback_data="menu_application"),
+                InlineKeyboardButton("ℹ️ Requirements", callback_data="menu_requirements"),
+            ],
+            [InlineKeyboardButton("📞 Support", callback_data="menu_support")],
+            [InlineKeyboardButton("🇪🇹 አማርኛ", callback_data="language_amharic")],
+        ]
+    )
+
+
+# Backward-compatible constant: all user-facing buttons are now inline.
+MAIN_MENU = main_menu_keyboard()
 
 APPLY_ENTRY = InlineKeyboardMarkup(
     [[InlineKeyboardButton("📢 Apply for Free Advertisement", callback_data="apply_start")]]
 )
+
+
+def requirements_keyboard(amharic: bool = False) -> InlineKeyboardMarkup:
+    if amharic:
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🇬🇧 English", callback_data="requirements_english")],
+                [InlineKeyboardButton("✅ መስፈርቶቹን አንብቤያለሁ", callback_data="requirements_confirm")],
+                [InlineKeyboardButton("↩️ ዋና ሜኑ", callback_data="menu_home")],
+            ]
+        )
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🇪🇹 አማርኛ", callback_data="requirements_amharic")],
+            [InlineKeyboardButton("✅ I Have Read the Requirements", callback_data="requirements_confirm")],
+            [InlineKeyboardButton("↩️ Main Menu", callback_data="menu_home")],
+        ]
+    )
+
+
+def user_back_keyboard(amharic: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("↩️ ዋና ሜኑ" if amharic else "↩️ Main Menu", callback_data="menu_home")]]
+    )
+
+
+def user_cancel_keyboard(amharic: bool = False) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("✖️ ሰርዝ" if amharic else "✖️ Cancel", callback_data="user_cancel")]]
+    )
 
 
 def admin_review_keyboard(application_id: int) -> InlineKeyboardMarkup:
@@ -63,8 +108,6 @@ def block_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-# Compatibility keyboards used by the current admin handlers. These additions do
-# not alter the user-facing ReplyKeyboard above.
 def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarkup:
     pending_label = f"📥 Pending Review ({pending_count})" if pending_count else "📥 Pending Review"
     return InlineKeyboardMarkup(
