@@ -4,13 +4,14 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Free Advertisement", callback_data="user_apply")],
+        [InlineKeyboardButton("📢 Apply for Promotion", callback_data="user_apply")],
         [InlineKeyboardButton("📋 My Application", callback_data="user_application"), InlineKeyboardButton("ℹ️ Requirements", callback_data="user_requirements")],
         [InlineKeyboardButton("💬 Contact Support", callback_data="user_support")],
     ])
 
 MAIN_MENU = main_menu_keyboard()
 APPLY_ENTRY = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Application", callback_data="apply_start")]])
+REQUIREMENTS_CONFIRM = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Have Read the Requirements", callback_data="requirements_confirm")]])
 
 def user_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
