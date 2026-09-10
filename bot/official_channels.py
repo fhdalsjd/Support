@@ -1,4 +1,4 @@
-"""Persistent admin-managed official channels used for automatic application decline."""
+"""Persistent admin-managed official channels used only to reject user submissions."""
 from __future__ import annotations
 
 import re
@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy import text
 from telegram import Update
-from telegram.ext import ApplicationHandlerStop, CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
+from telegram.ext import CallbackQueryHandler, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 
 from .config import settings
 from .database import engine
@@ -34,7 +34,7 @@ def ensure_official_channels_table() -> None:
 
 
 def _channel_username(value: str | None) -> str:
-    """Extract a public Telegram channel username from @name or a t.me/telegram.me link."""
+    """Normalize a public channel username from @name or a public Telegram URL."""
     if not value:
         return ""
     value = value.strip()
@@ -43,25 +43,26 @@ def _channel_username(value: str | None) -> str:
         return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
     if not value.startswith(("https://", "http://")):
         return ""
-    parsed = urlparse(value)
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return ""
     host = parsed.netloc.lower().split(":", 1)[0]
     if host not in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}:
         return ""
-    parts = [part for part in parsed.path.split("/") if part]
+    parts = [p for p in parsed.path.split("/") if p]
     if not parts:
         return ""
-    if parts[0].lower() in {"s", "c"}:
-        if parts[0].lower() == "c":
-            return ""
+    if parts[0].lower() == "s":
         parts = parts[1:]
-    if not parts or parts[0].startswith("+"):
+    if not parts or parts[0].lower() == "c" or parts[0].startswith(("+", "joinchat")):
         return ""
     username = parts[0].lstrip("@").lower()
     return username if re.fullmatch(r"[a-zA-Z0-9_]{4,32}", username) else ""
 
 
 def is_official_channel(username: str | None) -> bool:
-    """Return True only when the channel is explicitly protected by configuration/admin list."""
+    """Check only the administrator's protected-channel list; never contacts Telegram."""
     key = _channel_username(username)
     if not key:
         return False
@@ -72,19 +73,20 @@ def is_official_channel(username: str | None) -> bool:
 
     ensure_official_channels_table()
     with engine.connect() as connection:
-        row = connection.execute(
-            text("SELECT 1 FROM official_channels WHERE lower(username)=:username LIMIT 1"),
-            {"username": key},
-        ).first()
-    if row:
-        return True
+        rows = connection.execute(text("SELECT username, link FROM official_channels")).all()
+    for row in rows:
+        if _channel_username(str(row[0])) == key or _channel_username(str(row[1])) == key:
+            return True
 
-    configured = {_channel_username(link) for link in settings.moderation_channel_links}
-    return key in configured
+    return key in {_channel_username(link) for link in settings.moderation_channel_links}
 
 
 def is_official_post_url(post_url: str | None) -> bool:
-    """Hard pre-check for a submitted post URL; no Telegram/Telethon verification is performed."""
+    """Return whether the USER-SUBMITTED post belongs to an admin-protected channel.
+
+    This function performs local string/database matching only. It does not inspect
+    the post, resolve the channel, search Telegram, or monitor the channel.
+    """
     key = _channel_username(post_url)
     return bool(key and is_official_channel(key))
 
@@ -96,28 +98,6 @@ def _list_channels() -> list[tuple[int, str]]:
     return [(int(row[0]), str(row[1])) for row in rows]
 
 
-async def official_channel_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reject protected official-channel post URLs before any application/verification work."""
-    message = update.effective_message
-    user = update.effective_user
-    if not message or not user or user.id in settings.admin_ids or not message.text:
-        return
-
-    value = message.text.strip()
-    if not is_official_post_url(value):
-        return
-
-    await message.reply_text(
-        "🚫 <b>Official Channel Not Allowed</b>\n\n"
-        "Please send your <b>real channel</b> post link.\n\n"
-        "❌ Please do not send <b>Hf Bot official channels</b> or other protected official channels.\n\n"
-        "⚠️ <b>You may be banned for violating this rule.</b>\n\n"
-        "Send a post link from your own qualifying channel to continue.",
-        parse_mode="HTML",
-    )
-    raise ApplicationHandlerStop
-
-
 async def official_channels_page(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not _admin_allowed(update):
@@ -125,13 +105,11 @@ async def official_channels_page(update: Update, context: ContextTypes.DEFAULT_T
         return
     await query.answer()
     channels = _list_channels()
-    if channels:
-        channel_lines = "\n".join(f"• <b>@{username}</b>" for _, username in channels)
-    else:
-        channel_lines = "<i>No official channels have been added yet.</i>"
+    channel_lines = "\n".join(f"• <b>@{username}</b>" for _, username in channels) if channels else "<i>No official channels have been added yet.</i>"
     text_body = (
         "🛡️ <b>Official Channel Auto-Decline</b>\n\n"
-        "Channels saved here are automatically declined when a user submits a post from them.\n\n"
+        "The saved list is used only when a user submits an application post link. "
+        "Saved channels are never monitored or checked automatically.\n\n"
         "<b>Saved channels</b>\n"
         f"{channel_lines}\n\n"
         "Add a public channel using <code>@channelusername</code> or its <code>https://t.me/channelusername</code> link."
@@ -148,10 +126,9 @@ async def official_channel_add(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.message.reply_text(
         "➕ <b>Add Official Channel</b>\n\n"
         "Send the public channel as <code>@channelusername</code> or <code>https://t.me/channelusername</code>.\n\n"
-        "Private invite links are not supported for automatic matching.\n\n"
+        "This list is used only to reject user-submitted application links. It does not monitor the channel.\n\n"
         "Send /cancel to stop.",
-        parse_mode="HTML",
-        reply_markup=official_channel_cancel_keyboard(),
+        parse_mode="HTML", reply_markup=official_channel_cancel_keyboard(),
     )
     return WAITING_OFFICIAL_CHANNEL
 
@@ -171,9 +148,9 @@ async def official_channel_save(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as exc:
         if "unique" not in str(exc).lower() and "duplicate" not in str(exc).lower():
             raise
-        await update.message.reply_text(f"ℹ️ <b>@{username}</b> is already saved.\n\nAutomatic decline is already active for this channel.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
+        await update.message.reply_text(f"ℹ️ <b>@{username}</b> is already saved.\n\nThis channel is already protected from user applications.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
         return ConversationHandler.END
-    await update.message.reply_text(f"✅ <b>Official channel saved</b>\n\n<b>@{username}</b> is now protected by automatic decline.\n\nApplications submitted from this channel will be declined automatically.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
+    await update.message.reply_text(f"✅ <b>Official channel saved</b>\n\n<b>@{username}</b> will now be rejected when a user submits a post from this channel.\n\nNo monitoring or Telegram channel checking is started.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
     return ConversationHandler.END
 
 
@@ -196,7 +173,7 @@ async def official_channel_remove(update: Update, context: ContextTypes.DEFAULT_
             return
         username = str(row[0])
         connection.execute(text("DELETE FROM official_channels WHERE id=:id"), {"id": channel_id})
-    await query.edit_message_text(f"🗑️ <b>@{username} removed</b>\n\nAutomatic decline is no longer active for this saved channel.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
+    await query.edit_message_text(f"🗑️ <b>@{username} removed</b>\n\nUser-submission protection is no longer active for this saved channel.", parse_mode="HTML", reply_markup=official_channels_keyboard(_list_channels()))
 
 
 async def official_channel_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -222,7 +199,8 @@ def build_conversation() -> ConversationHandler:
 
 def register(application) -> None:
     ensure_official_channels_table()
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, official_channel_guard), group=-3)
+    # Deliberately NO global message guard: this feature does not monitor users.
+    # It is invoked only by receive_post_link() when the user is actually applying.
     application.add_handler(build_conversation())
     application.add_handler(CallbackQueryHandler(official_channels_page, pattern=r"^admin_official_channels$"))
     application.add_handler(CallbackQueryHandler(official_channel_remove, pattern=r"^official_channel_remove:\d+$"))
