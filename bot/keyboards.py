@@ -11,13 +11,25 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
 
 MAIN_MENU = main_menu_keyboard()
 APPLY_ENTRY = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 Start Application", callback_data="apply_start")]])
-REQUIREMENTS_CONFIRM = InlineKeyboardMarkup([[InlineKeyboardButton("✅ I Have Read the Requirements", callback_data="requirements_confirm")]])
+
+
+def requirements_keyboard(amharic: bool = False) -> InlineKeyboardMarkup:
+    language_label = "🇬🇧 English" if amharic else "🇪🇹 አማርኛ"
+    language_callback = "requirements_english" if amharic else "requirements_amharic"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(language_label, callback_data=language_callback)],
+        [InlineKeyboardButton("✅ I Have Read the Requirements" if not amharic else "✅ መስፈርቶቹን አንብቤያለሁ", callback_data="requirements_confirm")],
+        [InlineKeyboardButton("🏠 Main Menu" if not amharic else "🏠 ዋና ምናሌ", callback_data="user_home")],
+    ])
+
 
 def user_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="user_home")]])
 
+
 def user_cancel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("✖️ Cancel", callback_data="user_cancel")]])
+
 
 def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarkup:
     pending_label = f"📥 Pending Review ({pending_count})" if pending_count else "📥 Pending Review"
@@ -27,14 +39,17 @@ def admin_control_center_keyboard(pending_count: int = 0) -> InlineKeyboardMarku
         [InlineKeyboardButton("⚙️ Settings", callback_data="admin_settings")],
     ])
 
+
 def admin_back_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")]])
+
 
 def admin_broadcast_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Send Broadcast", callback_data="admin_broadcast_confirm")],
         [InlineKeyboardButton("✖️ Cancel", callback_data="admin_broadcast_cancel")],
     ])
+
 
 def admin_support_reply_keyboard(user_id: int, blocked: bool = False) -> InlineKeyboardMarkup:
     moderation = "🔓 Unblock User" if blocked else "🚫 Block User"
@@ -45,11 +60,13 @@ def admin_support_reply_keyboard(user_id: int, blocked: bool = False) -> InlineK
         [InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")],
     ])
 
+
 def admin_block_confirm_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🚫 Confirm Block", callback_data=f"admin_block_confirm:{user_id}"),
         InlineKeyboardButton("✖️ Cancel", callback_data="admin_center"),
     ]])
+
 
 def admin_review_keyboard(application_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -57,6 +74,7 @@ def admin_review_keyboard(application_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔎 View Details", callback_data=f"admin_details:{application_id}")],
         [InlineKeyboardButton("↩️ Control Center", callback_data="admin_center")],
     ])
+
 
 def admin_pending_list_keyboard(application_ids: list[int]) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(f"📄 Application #{app_id}", callback_data=f"admin_details:{app_id}")] for app_id in application_ids]
