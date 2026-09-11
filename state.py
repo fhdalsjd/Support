@@ -30,6 +30,7 @@ DEFAULT_STATE = {
     "slippage_bps": settings.default_slippage_bps,
     "priority_fee_microlamports": settings.default_priority_fee_microlamports,
     "auto_sniper_enabled": False,
+    "auto_sniper_allocation_pct": None,
     "default_tp_pct": 100.0,
     "default_sl_pct": 30.0,
 }
@@ -113,7 +114,6 @@ class StateStore:
                 self._data["positions"].pop(mint, None)
             else:
                 p["amount_tokens"] = remaining
-                # Exposure is reduced proportionally when entry_sol is known.
                 old_amount = max(remaining + sold_tokens, 1e-18)
                 old_entry = max(0.0, float(p.get("entry_sol", 0.0) or 0.0))
                 p["entry_sol"] = old_entry * (remaining / old_amount)
