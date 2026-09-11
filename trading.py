@@ -1,4 +1,4 @@
-"""Quote + swap execution with preflight simulation and balance diagnostics."""
+"""Quote + swap execution with preflight simulation and strict safety checks."""
 import asyncio
 import base64
 import re
@@ -45,7 +45,6 @@ class SwapResult:
 
 async def _request(method: str, url: str, **kwargs):
     attempts = 3 if method.upper() == "GET" else 2
-    last = None
     for attempt in range(attempts):
         try:
             async with httpx.AsyncClient(timeout=15) as http:
@@ -54,20 +53,19 @@ async def _request(method: str, url: str, **kwargs):
                     await asyncio.sleep(0.7 * (attempt + 1))
                     continue
                 return r
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
-            last = exc
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError):
             if attempt + 1 < attempts:
                 await asyncio.sleep(0.7 * (attempt + 1))
                 continue
             raise
-    if last:
-        raise last
     raise RuntimeError("HTTP request failed")
 
 
 async def get_quote(input_mint: str, output_mint: str, amount_lamports: int, slippage_bps: int) -> QuoteResult:
     if amount_lamports <= 0:
         raise ValueError("Swap amount must be positive")
+    if slippage_bps <= 0 or slippage_bps > 5000:
+        raise ValueError("Slippage must be between 1 and 5000 bps")
     params = {
         "inputMint": input_mint,
         "outputMint": output_mint,
@@ -133,13 +131,15 @@ async def execute_swap(
     amount_lamports: int,
     slippage_bps: int | None = None,
     priority_fee_microlamports: int | None = None,
-    add_jito_tip: bool = True,
+    add_jito_tip: bool = False,
 ) -> SwapResult:
-    slippage_bps = slippage_bps or settings.default_slippage_bps
-    priority_fee = priority_fee_microlamports or settings.default_priority_fee_microlamports
+    slippage_bps = settings.default_slippage_bps if slippage_bps is None else slippage_bps
+    priority_fee = settings.default_priority_fee_microlamports if priority_fee_microlamports is None else priority_fee_microlamports
 
     if input_mint == output_mint:
         return SwapResult(success=False, error="Input and output token are identical")
+    if not wallet.configured:
+        return SwapResult(success=False, error="No wallet connected")
 
     try:
         quote = await get_quote(input_mint, output_mint, amount_lamports, slippage_bps)
@@ -186,7 +186,10 @@ async def execute_swap(
     except Exception as e:
         return SwapResult(success=False, error=f"Sent but not confirmed in time: {e} (sig={sig})")
 
-    if add_jito_tip:
+    # A Jito tip is deliberately opt-in. Sending a separate transfer after a
+    # confirmed swap does not improve that already-broadcast transaction and
+    # would create an unnecessary second spend.
+    if add_jito_tip and settings.jito_tip_lamports > 0:
         try:
             await send_jito_tip(settings.jito_tip_lamports)
         except Exception:
@@ -197,6 +200,8 @@ async def execute_swap(
 
 async def send_jito_tip(lamports: int):
     import random
+    if lamports <= 0:
+        return
     tip_account = Pubkey.from_string(random.choice(JITO_TIP_ACCOUNTS))
     ix = transfer(TransferParams(from_pubkey=wallet.pubkey, to_pubkey=tip_account, lamports=lamports))
     latest = await wallet.client.get_latest_blockhash()
@@ -211,11 +216,17 @@ async def send_jito_tip(lamports: int):
 
 
 async def buy_token(mint: str, sol_amount: float, slippage_bps: int | None = None) -> SwapResult:
+    if sol_amount <= 0:
+        return SwapResult(success=False, error="Buy amount must be positive")
     if sol_amount > settings.max_buy_sol:
         return SwapResult(success=False, error=f"Amount exceeds MAX_BUY_SOL safety cap ({settings.max_buy_sol} SOL)")
     lamports = int(sol_amount * LAMPORTS_PER_SOL)
-    return await execute_swap(SOL_MINT, mint, lamports, slippage_bps)
+    return await execute_swap(SOL_MINT, mint, lamports, slippage_bps, add_jito_tip=False)
 
 
 async def sell_token(mint: str, token_amount_raw: int, decimals: int, slippage_bps: int | None = None) -> SwapResult:
-    return await execute_swap(mint, SOL_MINT, token_amount_raw, slippage_bps)
+    if token_amount_raw <= 0:
+        return SwapResult(success=False, error="Sell amount must be positive")
+    if decimals < 0 or decimals > 18:
+        return SwapResult(success=False, error="Invalid token decimals")
+    return await execute_swap(mint, SOL_MINT, token_amount_raw, slippage_bps, add_jito_tip=False)
