@@ -1,9 +1,7 @@
 """sniper.py — opt-in Solana discovery and guarded auto-buy loop.
 
 Every candidate goes through the same deterministic market/security analysis
-before a real transaction is allowed. The scanner is intentionally fail-closed:
-missing security data, excessive concentration, weak liquidity/flow, excessive
-momentum, price impact, or exposure limits cause a skip rather than a buy.
+before a real transaction is allowed. The scanner is intentionally fail-closed.
 """
 from __future__ import annotations
 
@@ -43,13 +41,10 @@ async def _pair(mint: str) -> dict | None:
 
 
 async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
-    # entry_sol is persisted for new positions. Older positions are conservatively
-    # counted as one configured auto buy rather than guessed from token prices.
     return sum(max(0.0, float(getattr(p, "entry_sol", 0.0) or 0.0)) for p in positions.values())
 
 
 async def tick(context) -> None:
-    """One discovery pass from the Telegram application's asyncio event loop."""
     global _last_buy_at
 
     st = await store.get_settings()
@@ -94,8 +89,8 @@ async def tick(context) -> None:
             change_5m = overview.change_5m
             age = overview.age_minutes
             ratio = overview.buy_sell_ratio_5m
+            trades_5m = overview.buys_5m + overview.sells_5m
 
-            # Hard market-quality gates.
             if liquidity < settings.auto_sniper_min_liquidity_usd:
                 continue
             if market_cap < settings.auto_sniper_min_market_cap_usd:
@@ -108,12 +103,16 @@ async def tick(context) -> None:
                 continue
             if age is None or age < settings.auto_sniper_min_age_minutes or age > settings.auto_sniper_max_age_minutes:
                 continue
+            if trades_5m < 5:
+                continue
             if overview.sells_5m > 0 and ratio < settings.auto_sniper_min_buy_sell_ratio:
+                continue
+            # A single whale can dominate a tiny memecoin even when the
+            # aggregate risk score looks acceptable; automation rejects >10%.
+            if rug.top_holder_pct is None or rug.top_holder_pct > 10:
                 continue
             if analysis.risk_score > settings.auto_sniper_max_risk_score:
                 continue
-            # Fail closed on unavailable RugCheck data. LOW is the only state
-            # permitted for automatic money movement.
             if rug.risk_level != "LOW" or rug.risk_score > settings.auto_sniper_max_risk_score:
                 continue
 
@@ -133,7 +132,6 @@ async def tick(context) -> None:
                 continue
 
             balance = await wallet.get_sol_balance()
-            # Keep a fee/rent reserve; never spend the last SOL in the wallet.
             reserve = max(0.002, settings.auto_sniper_buy_sol * 0.25)
             if balance < settings.auto_sniper_buy_sol + reserve:
                 await context.bot.send_message(
@@ -142,7 +140,6 @@ async def tick(context) -> None:
                 )
                 return
 
-            # Measure the token balance delta, not the entire wallet balance.
             before_balance = await wallet.get_token_balance(mint)
             result = await buy_token(mint, settings.auto_sniper_buy_sol, settings.auto_sniper_slippage_bps)
             if not result.success:
@@ -156,8 +153,6 @@ async def tick(context) -> None:
             after_balance = await wallet.get_token_balance(mint)
             token_delta = max(0.0, after_balance - before_balance)
             if token_delta <= 0:
-                # A confirmed swap without a measurable balance increase must not
-                # become a phantom position that the risk daemon cannot close.
                 log.error("Auto-buy confirmed but token balance delta is zero for %s", mint)
                 await context.bot.send_message(next(iter(settings.admin_ids)), f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`", parse_mode="Markdown")
                 return
@@ -182,7 +177,7 @@ async def tick(context) -> None:
                 f"Token: `${symbol}`\nMint: `{mint}`\n"
                 f"Risk: `{analysis.risk_score}/100`\n"
                 f"Liquidity: `${liquidity:,.0f}` ({overview.liquidity_mcap_pct:.1f}% of MC)\n"
-                f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}`\n"
+                f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}` • Trades: `{trades_5m}`\n"
                 f"Jupiter impact: `{quote.price_impact_pct:.2f}%`\n"
                 f"Amount: `{settings.auto_sniper_buy_sol}` SOL\nTx: `{result.signature}`",
                 parse_mode="Markdown",
