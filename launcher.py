@@ -1,14 +1,29 @@
 """Run the Telegram bot and live web dashboard in one Railway process."""
 from __future__ import annotations
 
+import importlib.util
 import logging
+import sys
 import threading
+from pathlib import Path
 
-import bot
 import dashboard
 
 
 log = logging.getLogger("launcher")
+BASE_DIR = Path(__file__).resolve().parent
+BOT_PATH = BASE_DIR / "bot.py"
+
+
+def load_bot_module():
+    """Load this project's bot.py explicitly, avoiding a possible package named 'bot'."""
+    spec = importlib.util.spec_from_file_location("support_bot_app", BOT_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load bot module from {BOT_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def run_dashboard() -> None:
@@ -20,10 +35,12 @@ def run_dashboard() -> None:
 
 
 if __name__ == "__main__":
-    # Keep the dashboard in a background thread. Telegram polling stays in the
-    # Railway main thread so python-telegram-bot can install/manage signal
-    # handlers normally and receive updates reliably.
-    dashboard.set_bot(bot)
+    bot_app = load_bot_module()
+    log.info("Loaded Telegram bot from %s; main=%s", BOT_PATH, hasattr(bot_app, "main"))
+
+    # Dashboard runs in the background; Telegram polling stays in the Railway
+    # main thread so python-telegram-bot can manage signals normally.
+    dashboard.set_bot(bot_app)
     dashboard_thread = threading.Thread(
         target=run_dashboard,
         name="web-dashboard",
@@ -32,4 +49,4 @@ if __name__ == "__main__":
     dashboard_thread.start()
 
     log.info("Starting Telegram bot polling in the Railway main thread")
-    bot.main()
+    bot_app.main()
