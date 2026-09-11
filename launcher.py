@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 import dashboard
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 log = logging.getLogger("launcher")
 BASE_DIR = Path(__file__).resolve().parent
@@ -155,10 +156,92 @@ if __name__ == "__main__":
 
     bot_app.do_buy = safe_do_buy
 
+    # Replace only the callback router so the admin must explicitly choose and
+    # confirm a per-trade allocation before auto-sniper can spend anything.
+    original_callback_router = bot_app.callback_router
+
+    async def guarded_callback_router(update, context):
+        query = update.callback_query
+        data = query.data or ""
+        user = update.effective_user
+        if not user or user.id not in bot_app.settings.admin_ids:
+            await query.answer("Not authorized", show_alert=True)
+            return
+
+        if data == "toggle_sniper":
+            await query.answer()
+            st = await bot_app.store.get_settings()
+            if st.get("auto_sniper_enabled"):
+                await bot_app.store.set_setting("auto_sniper_enabled", False)
+                await bot_app.store.set_setting("auto_sniper_allocation_pct", None)
+                await query.edit_message_text("🔴 *Auto-Sniper OFF*\n\nNo automatic buys are running.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Dashboard", callback_data="refresh_dashboard")]]))
+                return
+            await query.edit_message_text(
+                "🎯 *Enable Auto-Sniper*\n\n"
+                "Choose what percentage of your *spendable SOL* each new trade may use.\n\n"
+                "The fee reserve and safety buffer are never included in this percentage.\n\n"
+                "Choose a trade allocation:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("75%", callback_data="sniperpct:75"), InlineKeyboardButton("65%", callback_data="sniperpct:65")],
+                    [InlineKeyboardButton("25%", callback_data="sniperpct:25"), InlineKeyboardButton("10%", callback_data="sniperpct:10")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="snipercancel")],
+                ]),
+            )
+            return
+
+        if data.startswith("sniperpct:"):
+            await query.answer()
+            pct = float(data.split(":", 1)[1])
+            balance = await bot_app.wallet.get_sol_balance() if bot_app.wallet.configured else 0.0
+            spendable = max(0.0, balance - bot_app.settings.auto_fee_reserve_sol - bot_app.settings.auto_safety_buffer_sol)
+            estimated = min(spendable * pct / 100.0, bot_app.settings.max_buy_sol)
+            await query.edit_message_text(
+                f"🎯 *Confirm Auto-Sniper*\n\n"
+                f"Allocation: *{pct:g}%* of spendable SOL\n"
+                f"Wallet: `{balance:.6f} SOL`\n"
+                f"Protected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\n"
+                f"Spendable now: `{spendable:.6f} SOL`\n"
+                f"Estimated trade amount: `{estimated:.9f} SOL`\n\n"
+                "The amount is recalculated from the live wallet balance before every trade.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Confirm & Enable", callback_data=f"sniperconfirm:{pct:g}"), InlineKeyboardButton("⬅ Change", callback_data="toggle_sniper")],
+                    [InlineKeyboardButton("❌ Cancel", callback_data="snipercancel")],
+                ]),
+            )
+            return
+
+        if data.startswith("sniperconfirm:"):
+            await query.answer()
+            pct = float(data.split(":", 1)[1])
+            if not 0 < pct <= 100:
+                await query.edit_message_text("❌ Invalid allocation.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Dashboard", callback_data="refresh_dashboard")]]))
+                return
+            await bot_app.store.set_setting("auto_sniper_allocation_pct", pct)
+            await bot_app.store.set_setting("auto_sniper_enabled", True)
+            balance = await bot_app.wallet.get_sol_balance() if bot_app.wallet.configured else 0.0
+            spendable = max(0.0, balance - bot_app.settings.auto_fee_reserve_sol - bot_app.settings.auto_safety_buffer_sol)
+            estimated = min(spendable * pct / 100.0, bot_app.settings.max_buy_sol)
+            await query.edit_message_text(
+                f"🟢 *Auto-Sniper ON*\n\nAllocation: `{pct:g}%` of spendable SOL per trade\nCurrent estimated trade: `{estimated:.9f} SOL`\nProtected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\n\nLive balance is rechecked before every buy.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Turn Sniper OFF", callback_data="toggle_sniper")], [InlineKeyboardButton("🏠 Dashboard", callback_data="refresh_dashboard")]]),
+            )
+            return
+
+        if data == "snipercancel":
+            await query.answer()
+            await query.edit_message_text("Auto-Sniper setup cancelled. It remains OFF.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Dashboard", callback_data="refresh_dashboard")]]))
+            return
+
+        await original_callback_router(update, context)
+
+    bot_app.callback_router = guarded_callback_router
+
     original_tp_sl_daemon = bot_app.tp_sl_daemon
 
     async def combined_daemon(context):
-        # Smart protection first, hard TP/SL second, discovery last.
         await smart_sl.tick(context)
         await original_tp_sl_daemon(context)
         await sniper.tick(context)
