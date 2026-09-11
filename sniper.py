@@ -32,21 +32,14 @@ async def _latest_profiles() -> list[dict]:
 
 
 async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
-    return sum(
-        max(float(getattr(p, "entry_sol", 0.0) or 0.0), settings.auto_sniper_buy_sol)
-        for p in positions.values()
-    )
+    return sum(max(float(getattr(p, "entry_sol", 0.0) or 0.0), 0.0) for p in positions.values())
 
 
-async def _buy_is_funded_safely() -> tuple[bool, float, float]:
-    """Return whether a new auto-buy leaves the protected SOL reserve intact."""
+async def _available_trade_sol() -> tuple[float, float]:
+    """Return spendable SOL after the protected sell-fee reserve and buffer."""
     balance = await wallet.get_sol_balance()
-    required = (
-        settings.auto_sniper_buy_sol
-        + settings.auto_fee_reserve_sol
-        + settings.auto_safety_buffer_sol
-    )
-    return balance >= required, balance, required
+    protected = settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol
+    return max(0.0, balance - protected), balance
 
 
 async def tick(context) -> None:
@@ -55,24 +48,38 @@ async def tick(context) -> None:
     st = await store.get_settings()
     if not st.get("auto_sniper_enabled") or not wallet.configured:
         return
+
+    allocation_pct = st.get("auto_sniper_allocation_pct")
+    if allocation_pct is None:
+        # Auto-sniper must never trade until the admin explicitly selects
+        # the percentage of spendable SOL to allocate per new position.
+        return
+    try:
+        allocation_pct = float(allocation_pct)
+    except (TypeError, ValueError):
+        return
+    if not 0 < allocation_pct <= 100:
+        return
+
     if time.time() - _last_buy_at < settings.auto_sniper_cooldown_seconds:
         return
 
     positions = await store.get_positions()
     if len(positions) >= settings.auto_sniper_max_positions:
         return
-    if await _auto_exposure_sol(positions) + settings.auto_sniper_buy_sol > settings.auto_sniper_max_exposure_sol:
+
+    available_sol, balance = await _available_trade_sol()
+    trade_amount = min(
+        available_sol * allocation_pct / 100.0,
+        settings.max_buy_sol,
+    )
+    if trade_amount <= 0:
+        return
+    if await _auto_exposure_sol(positions) + trade_amount > settings.auto_sniper_max_exposure_sol:
         return
 
-    # Protect the SOL needed to execute future TP/SL/Smart-SL sells before
-    # doing any market discovery or spending. Never use the full wallet balance.
-    funded, balance, required = await _buy_is_funded_safely()
-    if not funded:
-        log.info(
-            "Auto-sniper waiting for fee reserve: balance=%.6f required=%.6f",
-            balance,
-            required,
-        )
+    # Keep enough SOL untouched for future TP/SL/Smart-SL sells and fees.
+    if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
         return
 
     try:
@@ -91,23 +98,14 @@ async def tick(context) -> None:
         _last_checked[mint] = now
 
         try:
-            # One deterministic snapshot feeds both the analysis/risk numbers
-            # and every execution gate. No second market lookup is used.
             overview, rug, analysis = await analyze_token(mint)
             if not overview.found or overview.price_usd <= 0:
                 continue
-
             if overview.data_quality != "HIGH":
-                log.info(
-                    "Auto-sniper blocked %s: data quality=%s warnings=%s",
-                    mint,
-                    overview.data_quality,
-                    overview.data_warnings,
-                )
+                log.info("Auto-sniper blocked %s: data quality=%s warnings=%s", mint, overview.data_quality, overview.data_warnings)
                 continue
             if overview.market_cap <= 0 or overview.total_supply <= 0 or overview.fdv <= 0:
                 continue
-
             if not rug.mint_authority_revoked or not rug.freeze_authority_revoked:
                 continue
             if rug.top_holder_pct is None or rug.top_holder_pct > 10:
@@ -143,34 +141,35 @@ async def tick(context) -> None:
             current_positions = await store.get_positions()
             if mint in current_positions or len(current_positions) >= settings.auto_sniper_max_positions:
                 continue
-            if await _auto_exposure_sol(current_positions) + settings.auto_sniper_buy_sol > settings.auto_sniper_max_exposure_sol:
+
+            # Recalculate allocation immediately before the quote/buy so a
+            # balance change cannot cause the bot to consume the protected reserve.
+            available_sol, balance = await _available_trade_sol()
+            trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol)
+            remaining_exposure = settings.auto_sniper_max_exposure_sol - await _auto_exposure_sol(current_positions)
+            trade_amount = min(trade_amount, remaining_exposure)
+            if trade_amount <= 0:
+                continue
+            if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
                 continue
 
             quote = await get_quote(
                 SOL_MINT,
                 mint,
-                int(settings.auto_sniper_buy_sol * 1_000_000_000),
+                int(trade_amount * 1_000_000_000),
                 settings.auto_sniper_slippage_bps,
             )
             if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
                 continue
 
-            # Re-check the wallet immediately before execution. This closes
-            # the race where another transaction spends SOL after the first
-            # balance check. The protected reserve is never spendable by the
-            # auto-buyer.
-            funded, balance, required = await _buy_is_funded_safely()
-            if not funded:
-                log.info(
-                    "Auto-sniper skipped %s: balance=%.6f required=%.6f",
-                    mint,
-                    balance,
-                    required,
-                )
+            # Final balance check immediately before spending.
+            available_sol, balance = await _available_trade_sol()
+            trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol, remaining_exposure)
+            if trade_amount <= 0 or balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
                 continue
 
             before_balance = await wallet.get_token_balance(mint)
-            result = await buy_token(mint, settings.auto_sniper_buy_sol, settings.auto_sniper_slippage_bps)
+            result = await buy_token(mint, trade_amount, settings.auto_sniper_slippage_bps)
             if not result.success:
                 log.warning("Auto-sniper buy failed for %s: %s", mint, result.error)
                 continue
@@ -183,11 +182,7 @@ async def tick(context) -> None:
             token_delta = max(0.0, after_balance - before_balance)
             if token_delta <= 0:
                 log.error("Auto-buy confirmed but token balance delta is zero for %s", mint)
-                await context.bot.send_message(
-                    next(iter(settings.admin_ids)),
-                    f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`",
-                    parse_mode="Markdown",
-                )
+                await context.bot.send_message(next(iter(settings.admin_ids)), f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`", parse_mode="Markdown")
                 return
 
             symbol = overview.symbol or "?"
@@ -199,7 +194,7 @@ async def tick(context) -> None:
                 decimals=decimals,
                 take_profit_pct=st["default_tp_pct"],
                 stop_loss_pct=st["default_sl_pct"],
-                entry_sol=settings.auto_sniper_buy_sol,
+                entry_sol=trade_amount,
             )
             await store.upsert_position(pos)
             _last_buy_at = time.time()
@@ -212,7 +207,8 @@ async def tick(context) -> None:
                 f"Liquidity: `${liquidity:,.0f}` ({overview.liquidity_mcap_pct:.1f}% of MC)\n"
                 f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}` • Trades: `{trades_5m}`\n"
                 f"Jupiter impact: `{quote.price_impact_pct:.2f}%`\n"
-                f"Amount: `{settings.auto_sniper_buy_sol}` SOL\n"
+                f"Allocation: `{allocation_pct:g}%` of spendable SOL\n"
+                f"Amount: `{trade_amount:.9f} SOL`\n"
                 f"Protected reserve: `{settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:.3f} SOL`\n"
                 f"Tx: `{result.signature}`",
                 parse_mode="Markdown",
