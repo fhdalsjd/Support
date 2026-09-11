@@ -37,7 +37,7 @@ class Settings:
     jito_tip_lamports: int = _int("JITO_TIP_LAMPORTS", 100_000)
 
     default_slippage_bps: int = _int("DEFAULT_SLIPPAGE_BPS", 500)
-    default_priority_fee_microlamports: int = _int("DEFAULT_PRIORITY_FEE_MICROLAMICRO_LAMPORTS", 50_000)
+    default_priority_fee_microlamports: int = _int("DEFAULT_PRIORITY_FEE_MICROLAMPORTS", 50_000)
     max_buy_sol: float = _float("MAX_BUY_SOL", 2.0)
 
     rugcheck_api: str = os.getenv("RUGCHECK_API", "https://api.rugcheck.xyz/v1")
