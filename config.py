@@ -30,8 +30,6 @@ class Settings:
     wallet_private_key_b58: str = os.getenv("WALLET_PRIVATE_KEY_B58", "").strip()
 
     rpc_url: str = os.getenv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
-    # Old quote-api.jup.ag/v6 is no longer usable. Lite API is the current no-key
-    # endpoint; production users can set JUPITER_QUOTE_API to their own endpoint.
     jupiter_quote_api: str = os.getenv("JUPITER_QUOTE_API", "https://lite-api.jup.ag/swap/v1")
     jupiter_price_api: str = os.getenv("JUPITER_PRICE_API", "https://lite-api.jup.ag/price/v3")
 
@@ -42,15 +40,24 @@ class Settings:
     default_priority_fee_microlamports: int = _int("DEFAULT_PRIORITY_FEE_MICROLAMPORTS", 50_000)
     max_buy_sol: float = _float("MAX_BUY_SOL", 2.0)
 
-    # Auto-sniper is opt-in in state.json. These env settings cap its exposure.
+    # Auto-sniper is opt-in in state.json. These limits are deliberately
+    # independent from the manual MAX_BUY_SOL cap.
     auto_sniper_buy_sol: float = _float("AUTO_SNIPER_BUY_SOL", 0.01)
     auto_sniper_min_liquidity_usd: float = _float("AUTO_SNIPER_MIN_LIQUIDITY_USD", 25000.0)
     auto_sniper_min_market_cap_usd: float = _float("AUTO_SNIPER_MIN_MARKET_CAP_USD", 50000.0)
     auto_sniper_min_volume_5m_usd: float = _float("AUTO_SNIPER_MIN_VOLUME_5M_USD", 1000.0)
     auto_sniper_max_price_impact_pct: float = _float("AUTO_SNIPER_MAX_PRICE_IMPACT_PCT", 5.0)
-    auto_sniper_max_risk_score: int = _int("AUTO_SNIPER_MAX_RISK_SCORE", 0)
+    auto_sniper_max_risk_score: int = _int("AUTO_SNIPER_MAX_RISK_SCORE", 20)
     auto_sniper_poll_seconds: int = _int("AUTO_SNIPER_POLL_SECONDS", 20)
     auto_sniper_cooldown_seconds: int = _int("AUTO_SNIPER_COOLDOWN_SECONDS", 900)
+    auto_sniper_max_positions: int = _int("AUTO_SNIPER_MAX_POSITIONS", 3)
+    auto_sniper_max_exposure_sol: float = _float("AUTO_SNIPER_MAX_EXPOSURE_SOL", 0.03)
+    auto_sniper_min_liquidity_mcap_pct: float = _float("AUTO_SNIPER_MIN_LIQUIDITY_MCAP_PCT", 8.0)
+    auto_sniper_max_5m_change_pct: float = _float("AUTO_SNIPER_MAX_5M_CHANGE_PCT", 25.0)
+    auto_sniper_min_age_minutes: int = _int("AUTO_SNIPER_MIN_AGE_MINUTES", 10)
+    auto_sniper_max_age_minutes: int = _int("AUTO_SNIPER_MAX_AGE_MINUTES", 1440)
+    auto_sniper_min_buy_sell_ratio: float = _float("AUTO_SNIPER_MIN_BUY_SELL_RATIO", 0.80)
+    auto_sniper_slippage_bps: int = _int("AUTO_SNIPER_SLIPPAGE_BPS", 300)
 
     # Smart SL: protect the original downside, move to break-even once proven,
     # then lock 50% of the best profit reached. The stop only moves upward.
@@ -63,7 +70,6 @@ class Settings:
     state_file: str = os.getenv("STATE_FILE", "./state.json")
 
     def validate(self):
-        """Validate only settings required for the Telegram service to start."""
         errs = []
         if not self.telegram_token:
             errs.append("TELEGRAM_BOT_TOKEN is missing")
@@ -73,6 +79,22 @@ class Settings:
             errs.append("Provide only ONE of WALLET_MNEMONIC / WALLET_PRIVATE_KEY_B58, not both")
         if self.auto_sniper_buy_sol <= 0 or self.auto_sniper_buy_sol > self.max_buy_sol:
             errs.append("AUTO_SNIPER_BUY_SOL must be > 0 and <= MAX_BUY_SOL")
+        if self.auto_sniper_max_positions < 1:
+            errs.append("AUTO_SNIPER_MAX_POSITIONS must be >= 1")
+        if self.auto_sniper_max_exposure_sol < self.auto_sniper_buy_sol:
+            errs.append("AUTO_SNIPER_MAX_EXPOSURE_SOL must be >= AUTO_SNIPER_BUY_SOL")
+        if self.auto_sniper_max_risk_score < 0 or self.auto_sniper_max_risk_score > 100:
+            errs.append("AUTO_SNIPER_MAX_RISK_SCORE must be between 0 and 100")
+        if self.auto_sniper_min_liquidity_mcap_pct < 0:
+            errs.append("AUTO_SNIPER_MIN_LIQUIDITY_MCAP_PCT must be >= 0")
+        if self.auto_sniper_max_5m_change_pct <= 0:
+            errs.append("AUTO_SNIPER_MAX_5M_CHANGE_PCT must be > 0")
+        if self.auto_sniper_min_age_minutes < 0 or self.auto_sniper_max_age_minutes < self.auto_sniper_min_age_minutes:
+            errs.append("AUTO_SNIPER age limits are invalid")
+        if self.auto_sniper_min_buy_sell_ratio < 0:
+            errs.append("AUTO_SNIPER_MIN_BUY_SELL_RATIO must be >= 0")
+        if self.auto_sniper_slippage_bps <= 0 or self.auto_sniper_slippage_bps > self.default_slippage_bps:
+            errs.append("AUTO_SNIPER_SLIPPAGE_BPS must be > 0 and <= DEFAULT_SLIPPAGE_BPS")
         if not 0 < self.smart_sl_lock_ratio <= 1:
             errs.append("SMART_SL_LOCK_RATIO must be > 0 and <= 1")
         if self.smart_sl_activation_pct <= 0:
@@ -81,6 +103,10 @@ class Settings:
             errs.append("SMART_SL_PROFIT_LOCK_START_PCT must be >= SMART_SL_ACTIVATION_PCT")
         if self.smart_sl_ratchet_step_pct <= 0:
             errs.append("SMART_SL_RATCHET_STEP_PCT must be > 0")
+        if self.default_slippage_bps <= 0 or self.default_slippage_bps > 5000:
+            errs.append("DEFAULT_SLIPPAGE_BPS must be between 1 and 5000")
+        if self.max_buy_sol <= 0:
+            errs.append("MAX_BUY_SOL must be > 0")
         if errs:
             raise RuntimeError("Config errors:\n- " + "\n- ".join(errs))
 
