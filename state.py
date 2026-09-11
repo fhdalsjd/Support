@@ -1,8 +1,8 @@
-"""JSON persistence for positions and bot settings."""
+"""JSON persistence for positions, trade history, and bot settings."""
 import asyncio
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from config import settings
 
@@ -23,10 +23,15 @@ class Position:
     peak_profit_pct: float = 0.0
     smart_stop_profit_pct: float | None = None
     entry_sol: float = 0.0
+    opened_at: float = 0.0
+    buy_signature: str | None = None
+    entry_snapshot: dict = field(default_factory=dict)
+    close_events: list = field(default_factory=list)
 
 
 DEFAULT_STATE = {
     "positions": {},
+    "history": [],
     "slippage_bps": settings.default_slippage_bps,
     "priority_fee_microlamports": settings.default_priority_fee_microlamports,
     "auto_sniper_enabled": False,
@@ -50,6 +55,8 @@ def _load() -> dict:
         data.setdefault(k, v)
     if not isinstance(data.get("positions"), dict):
         data["positions"] = {}
+    if not isinstance(data.get("history"), list):
+        data["history"] = []
     return data
 
 
@@ -89,6 +96,17 @@ class StateStore:
             self._data["positions"].pop(mint, None)
             _save(self._data)
 
+    async def append_history(self, record: dict):
+        """Persist an immutable completed-trade record, newest first."""
+        async with _lock:
+            self._data["history"].insert(0, record)
+            self._data["history"] = self._data["history"][:500]
+            _save(self._data)
+
+    async def get_history(self, limit: int = 50) -> list[dict]:
+        async with _lock:
+            return list(self._data.get("history", []))[:max(1, min(limit, 500))]
+
     async def reduce_position(self, mint: str, sell_fraction: float):
         if not 0 < sell_fraction <= 1:
             raise ValueError("sell_fraction must be between 0 and 1")
@@ -96,7 +114,10 @@ class StateStore:
             p = self._data["positions"].get(mint)
             if not p:
                 return
-            p["amount_tokens"] = max(0.0, float(p.get("amount_tokens", 0.0)) * (1 - sell_fraction))
+            old_amount = max(0.0, float(p.get("amount_tokens", 0.0)))
+            p["amount_tokens"] = max(0.0, old_amount * (1 - sell_fraction))
+            old_entry = max(0.0, float(p.get("entry_sol", 0.0) or 0.0))
+            p["entry_sol"] = old_entry * (1 - sell_fraction)
             if sell_fraction >= 0.999 or p["amount_tokens"] <= 0:
                 self._data["positions"].pop(mint, None)
             _save(self._data)
@@ -109,14 +130,14 @@ class StateStore:
             p = self._data["positions"].get(mint)
             if not p:
                 return
-            remaining = max(0.0, float(p.get("amount_tokens", 0.0)) - sold_tokens)
+            old_amount = max(0.0, float(p.get("amount_tokens", 0.0)))
+            remaining = max(0.0, old_amount - sold_tokens)
             if remaining <= 0:
                 self._data["positions"].pop(mint, None)
             else:
                 p["amount_tokens"] = remaining
-                old_amount = max(remaining + sold_tokens, 1e-18)
                 old_entry = max(0.0, float(p.get("entry_sol", 0.0) or 0.0))
-                p["entry_sol"] = old_entry * (remaining / old_amount)
+                p["entry_sol"] = old_entry * (remaining / max(old_amount, 1e-18))
             _save(self._data)
 
     async def get_settings(self) -> dict:
