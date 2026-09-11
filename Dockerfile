@@ -15,4 +15,4 @@ COPY . .
 
 RUN mkdir -p data
 
-CMD ["python", "bot.py"]
+CMD ["python", "launcher.py"]
