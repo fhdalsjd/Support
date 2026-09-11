@@ -35,12 +35,12 @@ def _extract_mint(text: str) -> str | None:
 
 def admin_only(handler):
     @functools.wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user = update.effective_user
         if not user or user.id not in settings.admin_ids:
             log.warning("Rejected message from non-admin user_id=%s", user.id if user else None)
             return
-        return await handler(update, context)
+        return await handler(update, context, *args, **kwargs)
     return wrapper
 
 
@@ -231,7 +231,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mint = _extract_mint(text)
     if mint:
         log.info("Detected Solana mint in Telegram message: %s...%s", mint[:6], mint[-4:])
-        await show_token_overview(update, context, mint)
+        try:
+            await show_token_overview(update, context, mint)
+        except Exception as exc:
+            log.exception("Token message handler failed: %s", type(exc).__name__)
+            await update.message.reply_text("⚠️ I received the token address, but the live token lookup failed. Please try again in a few seconds.")
         return
 
     # Never fail silently. This also makes clipboard/paste problems obvious.
