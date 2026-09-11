@@ -72,6 +72,8 @@ def _status() -> dict:
                 "amount_tokens": p.get("amount_tokens", 0),
                 "tp": p.get("take_profit_pct"),
                 "sl": p.get("stop_loss_pct"),
+                "smart_sl": p.get("smart_stop_profit_pct"),
+                "peak_profit": p.get("peak_profit_pct", 0),
             }
             for mint, p in positions.items()
         ],
@@ -80,6 +82,10 @@ def _status() -> dict:
             "Auto-sniper is wired to live DEX Screener discovery. When the Telegram Sniper toggle is ON, "
             "the bot checks new Solana profiles, liquidity, market cap, 5m volume/momentum, pool age, RugCheck, "
             "and a Jupiter route/price-impact gate before an automatic buy."
+        ),
+        "smart_sl_note": (
+            "Smart SL keeps the initial downside stop until the trade reaches +5%, then moves to break-even. "
+            "At +10% it locks 50% of peak profit and ratchets upward in 2% peak-profit steps."
         ),
     }
 
@@ -94,16 +100,18 @@ def _page() -> bytes:
     pos_rows = "".join(
         f"<tr><td><b>${html.escape(str(p['symbol']))}</b></td><td><code>{html.escape(p['mint'])}</code></td>"
         f"<td>${p['entry_price_usd']:.8f}</td><td>{p['amount_tokens']:.6f}</td>"
-        f"<td>+{p['tp']}%</td><td>-{p['sl']}%</td></tr>"
+        f"<td>+{p['tp']}%</td><td>-{p['sl']}%</td>"
+        f"<td>{('BE' if p['smart_sl'] == 0 else (f'+{p[\"smart_sl\"]:.1f}%' if p['smart_sl'] is not None else '—'))}</td>"
+        f"<td>+{p['peak_profit']:.1f}%</td></tr>"
         for p in s["positions"]
-    ) or '<tr><td colspan="6" class="muted">No open positions</td></tr>'
+    ) or '<tr><td colspan="8" class="muted">No open positions</td></tr>'
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Solana Bot Live Dashboard</title>
 <style>
 body{{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-system,sans-serif}}
-main{{max-width:1100px;margin:auto;padding:24px}} h1{{margin:0 0 6px}} .muted{{color:#8993a5}}
+main{{max-width:1200px;margin:auto;padding:24px}} h1{{margin:0 0 6px}} .muted{{color:#8993a5}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:20px 0}}
 .card{{background:#141821;border:1px solid #252c3a;border-radius:14px;padding:16px}} .value{{font-size:22px;font-weight:700;margin-top:8px}}
 .ok{{color:#52d273}} .warn{{color:#ffca5c}} .bad{{color:#ff6b6b}}
@@ -121,8 +129,9 @@ code{{font-size:11px}} .note{{background:#17130a;border:1px solid #4d3b13;paddin
 <div class="card"><div class="muted">Uptime</div><div class="value">{s["uptime_seconds"]}s</div></div>
 </div>
 <h2>Open positions</h2>
-<table><thead><tr><th>Token</th><th>Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>SL</th></tr></thead><tbody>{pos_rows}</tbody></table>
-<div class="note"><b>Auto-trading status</b><br>{html.escape(s["auto_trading_note"])}<br><br>
+<table><thead><tr><th>Token</th><th>Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody>{pos_rows}</tbody></table>
+<div class="note"><b>Smart stop-loss</b><br>{html.escape(s["smart_sl_note"])}<br><br>
+<b>Auto-trading status</b><br>{html.escape(s["auto_trading_note"])}<br><br>
 Safety gates are deliberately conservative. The Sniper toggle remains <b>OFF</b> until you enable it in Telegram; when ON, it can spend real SOL up to the configured AUTO_SNIPER_BUY_SOL amount.</div>
 <p class="small">No private key or recovery phrase is displayed. Last refresh: <span id="t"></span></p>
 <script>document.getElementById('t').textContent=new Date().toLocaleTimeString();setTimeout(()=>location.reload(),5000);</script>
