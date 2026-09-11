@@ -16,6 +16,7 @@ log = logging.getLogger("membot")
 MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 _pending_ca: dict[int, str] = {}
 _awaiting_custom_amount: dict[int, str] = {}
+_awaiting_custom_sell_pct: dict[int, str] = {}
 _awaiting_wallet_mnemonic: set[int] = set()
 _live_position_messages: dict[int, int] = {}
 
@@ -135,15 +136,13 @@ async def _token_view_data(mint: str):
 
 
 async def _render_token_message(message, context: ContextTypes.DEFAULT_TYPE, mint: str):
-    if not wallet.configured:
-        await message.edit_text("🔌 No wallet connected. Use /connect_wallet before trading.")
-        return
+    # Viewing token intelligence is read-only. Wallet is required only for trading.
     try:
         overview, rug, error = await _token_view_data(mint)
         if error:
             await message.edit_text(error, reply_markup=_back_kb())
             return
-        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴", "UNKNOWN": "⚪"}[rug.risk_level]
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴", "UNKNOWN": "⚪"}.get(rug.risk_level, "⚪")
         positions = await store.get_positions()
         pos = positions.get(mint)
         live_line = ""
@@ -161,13 +160,16 @@ async def _render_token_message(message, context: ContextTypes.DEFAULT_TYPE, min
             f"{risk_emoji} *RugCheck:* `{rug.risk_level}`\n"
             + ("\n".join(f"• {n}" for n in rug.notes[:5]) if rug.notes else "• No additional notes")
             + live_line
+            + ("\n🟢 Wallet ready for trading" if wallet.configured else "\n🔌 Connect wallet to buy/sell")
         )
         _pending_ca[message.chat_id] = mint
         buttons = [
             [InlineKeyboardButton("0.01 SOL", callback_data=f"buy:{mint}:0.01"), InlineKeyboardButton("0.05 SOL", callback_data=f"buy:{mint}:0.05"), InlineKeyboardButton("0.1 SOL", callback_data=f"buy:{mint}:0.1")],
             [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom:{mint}"), InlineKeyboardButton("🔄 Refresh Token", callback_data=f"tokenrefresh:{mint}")],
-            [InlineKeyboardButton("📊 Live PnL", callback_data="positions"), InlineKeyboardButton("❌ Close", callback_data="cancel")],
         ]
+        if pos:
+            buttons.append([InlineKeyboardButton("💼 Close Position", callback_data=f"closemenu:{mint}")])
+        buttons.append([InlineKeyboardButton("📊 Live PnL", callback_data="positions"), InlineKeyboardButton("❌ Close", callback_data="cancel")])
         await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
     except Exception as exc:
         log.exception("Token overview failed: %s", type(exc).__name__)
@@ -176,9 +178,6 @@ async def _render_token_message(message, context: ContextTypes.DEFAULT_TYPE, min
 
 @admin_only
 async def show_token_overview(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str):
-    if not wallet.configured:
-        await update.message.reply_text("🔌 No wallet connected. Use /connect_wallet before trading.")
-        return
     msg = await update.message.reply_text("🔎 Loading live token market...")
     await _render_token_message(msg, context, mint)
 
@@ -194,6 +193,17 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_wallet_mnemonic(update, context)
         return
     text = update.message.text.strip()
+    if chat_id in _awaiting_custom_sell_pct:
+        mint = _awaiting_custom_sell_pct.pop(chat_id)
+        try:
+            pct = float(text.replace("%", "").strip())
+            if not 0 < pct <= 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a close percentage from 0.01% to 100%. Example: 37.5")
+            return
+        await do_sell(update, context, mint, pct / 100.0)
+        return
     if chat_id in _awaiting_custom_amount:
         mint = _awaiting_custom_amount.pop(chat_id)
         try:
@@ -259,7 +269,16 @@ async def _positions_text_and_kb():
                 f"TP `+{pos.take_profit_pct}%` • Hard SL `-{pos.stop_loss_pct}%` • Smart SL `{smart}`\n"
                 f"Mint `{mint[:8]}…{mint[-6:]}`"
             )
-            rows.append([InlineKeyboardButton("Sell 25%", callback_data=f"sell:{mint}:0.25"), InlineKeyboardButton("Sell 50%", callback_data=f"sell:{mint}:0.5"), InlineKeyboardButton("Sell 100%", callback_data=f"sell:{mint}:1.0")])
+            rows.append([
+                InlineKeyboardButton("Sell 25%", callback_data=f"sell:{mint}:0.25"),
+                InlineKeyboardButton("Sell 50%", callback_data=f"sell:{mint}:0.50"),
+                InlineKeyboardButton("Sell 75%", callback_data=f"sell:{mint}:0.75"),
+            ])
+            rows.append([
+                InlineKeyboardButton("Sell 100%", callback_data=f"sell:{mint}:1.00"),
+                InlineKeyboardButton("✏️ Close %", callback_data=f"sellcustom:{mint}"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="positions"),
+            ])
         except Exception as exc:
             log.warning("Position display failed: %s", type(exc).__name__)
             chunks.append(f"*${pos.symbol}*\n⚠️ Price temporarily unavailable")
@@ -291,7 +310,11 @@ async def do_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str,
     if not wallet.configured:
         await context.bot.send_message(chat_id, "🔌 No wallet connected. Use /connect_wallet first.")
         return
-    notice = await context.bot.send_message(chat_id, f"⏳ Selling {int(fraction*100)}%...")
+    if not 0 < fraction <= 1:
+        await context.bot.send_message(chat_id, "❌ Close percentage must be between 0.01% and 100%.")
+        return
+    pct = fraction * 100.0
+    notice = await context.bot.send_message(chat_id, f"⏳ Selling {pct:g}% of the recorded position...")
     try:
         positions = await store.get_positions()
         pos = positions.get(mint)
@@ -304,19 +327,47 @@ async def do_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str,
             await notice.edit_text("Wallet shows zero token balance already — clearing position.")
             return
         raw_units = int(balance * fraction * (10 ** pos.decimals))
+        if raw_units <= 0:
+            await notice.edit_text("❌ Close amount is too small for the token precision.")
+            return
         result = await sell_token(mint, raw_units, pos.decimals)
         if not result.success:
             await notice.edit_text(result.error or "❌ Sell failed")
             return
         await store.reduce_position(mint, fraction)
-        await notice.edit_text(f"✅ Sold {int(fraction*100)}% of ${pos.symbol}\nTx: `{result.signature}`", parse_mode="Markdown")
+        if fraction >= 0.999999:
+            confirmation = f"✅ Closed 100% of ${pos.symbol}"
+        else:
+            confirmation = f"✅ Sold {pct:g}% of ${pos.symbol}"
+        await notice.edit_text(f"{confirmation}\nTx: `{result.signature}`", parse_mode="Markdown")
     except Exception as exc:
         log.exception("Sell failed: %s", type(exc).__name__)
         await notice.edit_text("❌ Sell failed due to a temporary error.")
 
 
+def _close_position_kb(mint: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("25%", callback_data=f"sell:{mint}:0.25"), InlineKeyboardButton("50%", callback_data=f"sell:{mint}:0.50"), InlineKeyboardButton("75%", callback_data=f"sell:{mint}:0.75")],
+        [InlineKeyboardButton("100% Close", callback_data=f"sell:{mint}:1.00"), InlineKeyboardButton("✏️ Write %", callback_data=f"sellcustom:{mint}")],
+        [InlineKeyboardButton("⬅ Positions", callback_data="positions")],
+    ])
+
+
 def _back_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="refresh_dashboard")]])
+
+
+async def show_close_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str):
+    positions = await store.get_positions()
+    pos = positions.get(mint)
+    if not pos:
+        await update.callback_query.edit_message_text("No open position for this token.", reply_markup=_back_kb())
+        return
+    await update.callback_query.edit_message_text(
+        f"💼 *Close ${pos.symbol} position*\n\nChoose how much of the current token balance to sell:\n• 25%\n• 50%\n• 75%\n• 100%\n• Write any percentage from 0.01–100%",
+        reply_markup=_close_position_kb(mint),
+        parse_mode="Markdown",
+    )
 
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -359,6 +410,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, mint = data.split(":", 1)
         _awaiting_custom_amount[query.message.chat_id] = mint
         await query.edit_message_text(f"Enter the SOL amount to buy for `{mint[:8]}...`\n\nThe bot will preflight the transaction and show the exact SOL balance/top-up required if funds are insufficient.", parse_mode="Markdown")
+    elif data.startswith("closemenu:"):
+        _, mint = data.split(":", 1)
+        await show_close_menu(update, context, mint)
+    elif data.startswith("sellcustom:"):
+        _, mint = data.split(":", 1)
+        positions = await store.get_positions()
+        if mint not in positions:
+            await query.edit_message_text("No open position for that token.", reply_markup=_back_kb())
+            return
+        _awaiting_custom_sell_pct[query.message.chat_id] = mint
+        await query.edit_message_text(
+            f"✏️ *Manual position close*\n\nEnter the percentage to sell for `{mint[:8]}...`\n\nAllowed: `0.01` to `100`\nExamples: `25`, `37.5`, `82.25`, `100`",
+            parse_mode="Markdown",
+        )
     elif data.startswith("sell:"):
         _, mint, fraction = data.split(":")
         await do_sell(update, context, mint, float(fraction))
