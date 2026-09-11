@@ -1,17 +1,21 @@
 """Run the Telegram bot and live web dashboard in one Railway process."""
 from __future__ import annotations
 
+import logging
 import threading
 
 import bot
 import dashboard
 
 
+log = logging.getLogger("launcher")
+
+
 def run_dashboard() -> None:
     try:
         dashboard.serve()
     except Exception:
-        bot.log.exception("Web dashboard stopped unexpectedly")
+        log.exception("Web dashboard stopped unexpectedly")
         raise
 
 
@@ -27,5 +31,5 @@ if __name__ == "__main__":
     )
     dashboard_thread.start()
 
-    bot.log.info("Starting Telegram bot polling in the Railway main thread")
+    log.info("Starting Telegram bot polling in the Railway main thread")
     bot.main()
