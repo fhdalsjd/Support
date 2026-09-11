@@ -1,7 +1,4 @@
-"""
-state.py — JSON persistence for positions and bot settings.
-The schema is backward compatible with older Position records.
-"""
+"""JSON persistence for positions and bot settings."""
 import asyncio
 import json
 import os
@@ -25,8 +22,6 @@ class Position:
     trailing_high_price: float | None = None
     peak_profit_pct: float = 0.0
     smart_stop_profit_pct: float | None = None
-    # SOL committed to this position. Used only for exposure accounting; it is
-    # not treated as a current valuation or profit calculation.
     entry_sol: float = 0.0
 
 
@@ -49,8 +44,6 @@ def _load() -> dict:
         if not isinstance(data, dict):
             raise ValueError("state root must be an object")
     except Exception:
-        # Do not crash the trading service because a stale/corrupt state file
-        # exists. Start clean; the old file is left untouched for investigation.
         return json.loads(json.dumps(DEFAULT_STATE))
     for k, v in DEFAULT_STATE.items():
         data.setdefault(k, v)
@@ -82,8 +75,6 @@ class StateStore:
                 try:
                     positions[mint] = Position(**raw)
                 except TypeError:
-                    # Ignore malformed single-position records instead of
-                    # taking down all risk management.
                     continue
             return positions
 
@@ -98,7 +89,6 @@ class StateStore:
             _save(self._data)
 
     async def reduce_position(self, mint: str, sell_fraction: float):
-        """Shrink the recorded position after a successful partial sale."""
         if not 0 < sell_fraction <= 1:
             raise ValueError("sell_fraction must be between 0 and 1")
         async with _lock:
@@ -108,6 +98,25 @@ class StateStore:
             p["amount_tokens"] = max(0.0, float(p.get("amount_tokens", 0.0)) * (1 - sell_fraction))
             if sell_fraction >= 0.999 or p["amount_tokens"] <= 0:
                 self._data["positions"].pop(mint, None)
+            _save(self._data)
+
+    async def reduce_position_amount(self, mint: str, sold_tokens: float):
+        """Subtract the exact token quantity successfully sold from a position."""
+        if sold_tokens <= 0:
+            raise ValueError("sold_tokens must be positive")
+        async with _lock:
+            p = self._data["positions"].get(mint)
+            if not p:
+                return
+            remaining = max(0.0, float(p.get("amount_tokens", 0.0)) - sold_tokens)
+            if remaining <= 0:
+                self._data["positions"].pop(mint, None)
+            else:
+                p["amount_tokens"] = remaining
+                # Exposure is reduced proportionally when entry_sol is known.
+                old_amount = max(remaining + sold_tokens, 1e-18)
+                old_entry = max(0.0, float(p.get("entry_sol", 0.0) or 0.0))
+                p["entry_sol"] = old_entry * (remaining / old_amount)
             _save(self._data)
 
     async def get_settings(self) -> dict:
