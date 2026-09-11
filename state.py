@@ -7,7 +7,7 @@ with a flat file guarded by an asyncio lock.
 import json
 import asyncio
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 
 from config import settings
 
@@ -25,6 +25,9 @@ class Position:
     stop_loss_pct: float | None = None
     trailing_sl_pct: float | None = None
     trailing_high_price: float | None = None
+    # Smart SL state: the stop can only ratchet toward profit and never widen.
+    peak_profit_pct: float = 0.0
+    smart_stop_profit_pct: float | None = None
 
 
 DEFAULT_STATE = {
@@ -58,7 +61,11 @@ class StateStore:
 
     async def get_positions(self) -> dict[str, Position]:
         async with _lock:
-            return {m: Position(**p) for m, p in self._data["positions"].items()}
+            positions = {}
+            for mint, raw in self._data["positions"].items():
+                # Dataclass defaults keep older state.json positions compatible.
+                positions[mint] = Position(**raw)
+            return positions
 
     async def upsert_position(self, pos: Position):
         async with _lock:
