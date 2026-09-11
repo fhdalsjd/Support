@@ -1,4 +1,4 @@
-"""Run the Telegram bot and live web dashboard in one Railway process."""
+"""Run the Telegram bot, live dashboard, and auto-sniper in one Railway process."""
 from __future__ import annotations
 
 import importlib.util
@@ -8,7 +8,6 @@ import threading
 from pathlib import Path
 
 import dashboard
-
 
 log = logging.getLogger("launcher")
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,8 +37,19 @@ if __name__ == "__main__":
     bot_app = load_bot_module()
     log.info("Loaded Telegram bot from %s; main=%s", BOT_PATH, hasattr(bot_app, "main"))
 
-    # Dashboard runs in the background; Telegram polling stays in the Railway
-    # main thread so python-telegram-bot can manage signals normally.
+    # Import after bot.py so sniper.py shares the exact same wallet/state modules.
+    import sniper
+
+    # Run discovery from the Telegram application's asyncio event loop. This is
+    # important because the wallet's AsyncClient is created by the bot process.
+    original_tp_sl_daemon = bot_app.tp_sl_daemon
+
+    async def combined_daemon(context):
+        await original_tp_sl_daemon(context)
+        await sniper.tick(context)
+
+    bot_app.tp_sl_daemon = combined_daemon
+
     dashboard.set_bot(bot_app)
     dashboard_thread = threading.Thread(
         target=run_dashboard,
@@ -48,5 +58,5 @@ if __name__ == "__main__":
     )
     dashboard_thread.start()
 
-    log.info("Starting Telegram bot polling in the Railway main thread")
+    log.info("Starting Telegram polling + TP/SL + auto-sniper in the Railway main thread")
     bot_app.main()
