@@ -15,7 +15,6 @@ BOT_PATH = BASE_DIR / "bot.py"
 
 
 def load_bot_module():
-    """Load this project's bot.py explicitly, avoiding a possible package named 'bot'."""
     spec = importlib.util.spec_from_file_location("support_bot_app", BOT_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Could not load bot module from {BOT_PATH}")
@@ -39,9 +38,9 @@ if __name__ == "__main__":
 
     import sniper
     import smart_sl
+    from solders.pubkey import Pubkey
     from trading import sell_token
 
-    # Never let an exit sell unrelated tokens held in the same wallet.
     async def safe_auto_close(context, admin_id, mint, pos, reason):
         try:
             wallet_balance = await bot_app.wallet.get_token_balance(mint)
@@ -63,8 +62,6 @@ if __name__ == "__main__":
         except Exception as exc:
             log.warning("Safe auto-close failed: %s", type(exc).__name__)
 
-    # Replace the original helpers before Telegram starts; callback handlers
-    # resolve these globals at runtime, so both manual and daemon exits use them.
     bot_app._auto_close = safe_auto_close
 
     async def safe_do_sell(update, context, mint, fraction):
@@ -113,6 +110,9 @@ if __name__ == "__main__":
         notice = await context.bot.send_message(chat_id, f"⏳ Preflighting buy of `{sol_amount:.9f} SOL`...", parse_mode="Markdown")
         try:
             overview = await bot_app.get_token_overview(mint)
+            if not overview.found or overview.price_usd <= 0:
+                await notice.edit_text("❌ No reliable live market price is available for this token. Buy cancelled.")
+                return
             before = await bot_app.wallet.get_token_balance(mint)
             result = await bot_app.buy_token(mint, sol_amount)
             if not result.success:
@@ -124,17 +124,15 @@ if __name__ == "__main__":
                 await notice.edit_text("⚠️ Buy confirmed but token balance did not increase; position was not recorded. Check the transaction before trading it.")
                 return
             try:
-                decimals = (await bot_app.wallet.client.get_token_supply(bot_app.Pubkey.from_string(mint))).value.decimals
+                decimals = (await bot_app.wallet.client.get_token_supply(Pubkey.from_string(mint))).value.decimals
             except Exception:
                 decimals = 9
             st = await bot_app.store.get_settings()
-            old_positions = await bot_app.store.get_positions()
-            old = old_positions.get(mint)
+            old = (await bot_app.store.get_positions()).get(mint)
             if old:
                 total_tokens = old.amount_tokens + token_delta
-                weighted_entry = ((old.entry_price_usd * old.amount_tokens) + (overview.price_usd * token_delta)) / total_tokens
+                old.entry_price_usd = ((old.entry_price_usd * old.amount_tokens) + (overview.price_usd * token_delta)) / total_tokens
                 old.amount_tokens = total_tokens
-                old.entry_price_usd = weighted_entry
                 old.entry_sol = (old.entry_sol or 0.0) + sol_amount
                 old.decimals = decimals
                 await bot_app.store.upsert_position(old)
@@ -150,7 +148,7 @@ if __name__ == "__main__":
                     entry_sol=sol_amount,
                 )
                 await bot_app.store.upsert_position(pos)
-            await notice.edit_text(f"✅ *Bought ${overview.symbol}*\nAmount: `{sol_amount:.9f} SOL`\nTokens received: `{token_delta:.8g}`\nTx: `{result.signature}`\n\n📊 Position accounting is based on the actual token balance delta.", parse_mode="Markdown")
+            await notice.edit_text(f"✅ *Bought ${overview.symbol}*\nAmount: `{sol_amount:.9f} SOL`\nTokens received: `{token_delta:.8g}`\nTx: `{result.signature}`\n\n📊 Position accounting uses the actual token balance delta.", parse_mode="Markdown")
         except Exception as exc:
             log.exception("Buy failed: %s", type(exc).__name__)
             await notice.edit_text("❌ Buy failed due to a temporary error. No wallet credential was exposed.")
@@ -160,8 +158,7 @@ if __name__ == "__main__":
     original_tp_sl_daemon = bot_app.tp_sl_daemon
 
     async def combined_daemon(context):
-        # Tighten smart protection first, then hard TP/SL, then scan for a new
-        # auto-trade. They execute sequentially in the Telegram event loop.
+        # Smart protection first, hard TP/SL second, discovery last.
         await smart_sl.tick(context)
         await original_tp_sl_daemon(context)
         await sniper.tick(context)
