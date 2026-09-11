@@ -1,9 +1,4 @@
-"""sniper.py — opt-in Solana token discovery and guarded auto-buy loop.
-
-Discovery uses DEX Screener's latest Solana token profiles. A candidate must
-pass liquidity, market-cap, momentum, token-age, RugCheck, and Jupiter quote
-checks before a small automatic buy is attempted.
-"""
+"""sniper.py — opt-in Solana token discovery and guarded auto-buy loop."""
 from __future__ import annotations
 
 import logging
@@ -19,16 +14,17 @@ from trading import SOL_MINT, buy_token, get_quote
 from wallet import wallet
 
 log = logging.getLogger("sniper")
-
-_seen: set[str] = set()
+_last_checked: dict[str, float] = {}
 _last_buy_at = 0.0
+_RECHECK_SECONDS = 300
 
 
 async def _latest_profiles() -> list[dict]:
     async with httpx.AsyncClient(timeout=10) as http:
         r = await http.get("https://api.dexscreener.com/token-profiles/latest/v1")
         r.raise_for_status()
-        return r.json() if isinstance(r.json(), list) else []
+        data = r.json()
+        return data if isinstance(data, list) else []
 
 
 async def _pair(mint: str) -> dict | None:
@@ -43,7 +39,7 @@ async def _pair(mint: str) -> dict | None:
 
 
 async def tick(context) -> None:
-    """One discovery pass. Called from the Telegram application's event loop."""
+    """One discovery pass from the Telegram application's asyncio event loop."""
     global _last_buy_at
 
     st = await store.get_settings()
@@ -58,15 +54,14 @@ async def tick(context) -> None:
         log.warning("Auto-sniper discovery failed: %s", type(exc).__name__)
         return
 
-    # DEX Screener documents this endpoint at 60 requests/minute, so one
-    # discovery request per pass with a conservative 20s default is safe.
+    now = time.time()
     for profile in profiles:
         if profile.get("chainId") != "solana":
             continue
         mint = profile.get("tokenAddress")
-        if not mint or mint in _seen:
+        if not mint or now - _last_checked.get(mint, 0) < _RECHECK_SECONDS:
             continue
-        _seen.add(mint)
+        _last_checked[mint] = now
 
         try:
             pair = await _pair(mint)
@@ -78,8 +73,10 @@ async def tick(context) -> None:
             volume_5m = float((pair.get("volume") or {}).get("m5") or 0)
             change_5m = float((pair.get("priceChange") or {}).get("m5") or 0)
             created_ms = int(pair.get("pairCreatedAt") or 0)
-            age_minutes = (time.time() * 1000 - created_ms) / 60000 if created_ms else 999999
+            age_minutes = (now * 1000 - created_ms) / 60000 if created_ms else 999999
 
+            # Conservative gates: enough liquidity/volume, positive but not
+            # parabolic 5m momentum, and a pool with a little trading history.
             if liquidity < settings.auto_sniper_min_liquidity_usd:
                 continue
             if market_cap < settings.auto_sniper_min_market_cap_usd:
@@ -88,8 +85,6 @@ async def tick(context) -> None:
                 continue
             if change_5m <= 0 or change_5m > 35:
                 continue
-            # Focus on newly active pools, but do not buy an instant launch with
-            # no trading history. Five minutes to 24 hours is the default window.
             if age_minutes < 5 or age_minutes > 1440:
                 continue
 
@@ -101,8 +96,6 @@ async def tick(context) -> None:
             if rug.risk_level != "LOW":
                 continue
 
-            # Quote before signing: this confirms Jupiter has an executable route
-            # and rejects excessive price impact before any SOL is spent.
             quote = await get_quote(
                 SOL_MINT,
                 mint,
@@ -116,7 +109,7 @@ async def tick(context) -> None:
             if balance < settings.auto_sniper_buy_sol + 0.002:
                 await context.bot.send_message(
                     next(iter(settings.admin_ids)),
-                    f"⚠️ Auto-sniper skipped: wallet SOL balance too low for the configured {settings.auto_sniper_buy_sol} SOL buy."
+                    f"⚠️ Auto-sniper paused: wallet balance is below the configured {settings.auto_sniper_buy_sol} SOL buy plus fees."
                 )
                 return
 
@@ -156,6 +149,6 @@ async def tick(context) -> None:
                 f"Tx: `{result.signature}`",
                 parse_mode="Markdown",
             )
-            return  # one automatic buy per discovery pass
+            return
         except Exception as exc:
             log.warning("Auto-sniper candidate check failed: %s", type(exc).__name__)
