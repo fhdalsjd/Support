@@ -1,4 +1,4 @@
-"""Run the Telegram bot, live dashboard, and auto-sniper in one Railway process."""
+"""Run the Telegram bot, live dashboard, auto-sniper, and smart SL in one Railway process."""
 from __future__ import annotations
 
 import importlib.util
@@ -37,14 +37,17 @@ if __name__ == "__main__":
     bot_app = load_bot_module()
     log.info("Loaded Telegram bot from %s; main=%s", BOT_PATH, hasattr(bot_app, "main"))
 
-    # Import after bot.py so sniper.py shares the exact same wallet/state modules.
+    # Import after bot.py so sniper.py and smart_sl.py share the exact same
+    # wallet/state/security/trading modules and asyncio event loop.
     import sniper
+    import smart_sl
 
-    # Run discovery from the Telegram application's asyncio event loop. This is
-    # important because the wallet's AsyncClient is created by the bot process.
+    # Run all trading checks from the Telegram application's asyncio event loop.
+    # Smart SL runs first so a newly tightened stop can be enforced immediately.
     original_tp_sl_daemon = bot_app.tp_sl_daemon
 
     async def combined_daemon(context):
+        await smart_sl.tick(context)
         await original_tp_sl_daemon(context)
         await sniper.tick(context)
 
@@ -58,5 +61,5 @@ if __name__ == "__main__":
     )
     dashboard_thread.start()
 
-    log.info("Starting Telegram polling + TP/SL + auto-sniper in the Railway main thread")
+    log.info("Starting Telegram polling + smart SL + TP/SL + auto-sniper in the Railway main thread")
     bot_app.main()
