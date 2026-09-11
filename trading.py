@@ -1,11 +1,7 @@
-"""
-trading.py — Quote + swap execution.
-
-Uses Jupiter's current Lite Swap API. The old quote-api.jup.ag/v6 host is
-retired/unreachable; lite-api.jup.ag/swap/v1 is the no-key endpoint.
-"""
+"""Quote + swap execution with preflight simulation and balance diagnostics."""
 import asyncio
 import base64
+import re
 import httpx
 from dataclasses import dataclass
 from solders.transaction import VersionedTransaction
@@ -21,11 +17,11 @@ JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
 ]
+INSUFFICIENT_RE = re.compile(r"insufficient lamports (\d+), need (\d+)", re.I)
 
 
 def _jupiter_base() -> str:
     base = settings.jupiter_quote_api.rstrip("/")
-    # Protect Railway deployments that still have the old variable configured.
     if "quote-api.jup.ag" in base or base.endswith("/v6"):
         return "https://lite-api.jup.ag/swap/v1"
     return base
@@ -48,7 +44,6 @@ class SwapResult:
 
 
 async def _request(method: str, url: str, **kwargs):
-    """Retry transient DNS/network/5xx failures without ever retrying a swap POST blindly."""
     attempts = 3 if method.upper() == "GET" else 2
     last = None
     for attempt in range(attempts):
@@ -115,6 +110,23 @@ async def build_swap_transaction(quote: QuoteResult, priority_fee_microlamports:
     return VersionedTransaction.from_bytes(raw)
 
 
+def _insufficient_balance_message(current_lamports: int, diagnostic: str) -> str | None:
+    match = INSUFFICIENT_RE.search(diagnostic)
+    if not match:
+        return None
+    available_in_instruction = int(match.group(1))
+    needed_by_instruction = int(match.group(2))
+    shortfall = max(0, needed_by_instruction - available_in_instruction)
+    required_start = current_lamports + shortfall
+    top_up = max(0, required_start - current_lamports)
+    return (
+        "❌ Insufficient SOL balance.\n"
+        f"Current: {current_lamports / LAMPORTS_PER_SOL:.9f} SOL\n"
+        f"Required: {required_start / LAMPORTS_PER_SOL:.9f} SOL\n"
+        f"Please add at least {top_up / LAMPORTS_PER_SOL:.9f} SOL, then press Refresh and try again."
+    )
+
+
 async def execute_swap(
     input_mint: str,
     output_mint: str,
@@ -141,14 +153,32 @@ async def execute_swap(
 
     try:
         tx = await build_swap_transaction(quote, priority_fee)
+        current_lamports = int((await wallet.client.get_balance(wallet.pubkey, commitment="confirmed")).value)
+        signed_tx = wallet.sign_transaction(tx)
+        simulation = await wallet.client.simulate_transaction(signed_tx, sig_verify=False, commitment="confirmed")
+        sim_value = simulation.value
+        if sim_value.err is not None:
+            diagnostic = str(sim_value.err)
+            if sim_value.logs:
+                diagnostic += " " + " ".join(sim_value.logs)
+            friendly = _insufficient_balance_message(current_lamports, diagnostic)
+            if friendly:
+                return SwapResult(success=False, error=friendly)
+            return SwapResult(success=False, error=f"Transaction simulation rejected: {diagnostic[:1200]}")
     except Exception as e:
-        return SwapResult(success=False, error=f"Failed to build swap tx: {e}")
+        return SwapResult(success=False, error=f"Preflight simulation failed: {e}")
 
-    signed_tx = wallet.sign_transaction(tx)
     try:
         resp = await wallet.client.send_raw_transaction(bytes(signed_tx))
         sig = str(resp.value)
     except Exception as e:
+        try:
+            current_lamports = int((await wallet.client.get_balance(wallet.pubkey, commitment="confirmed")).value)
+            friendly = _insufficient_balance_message(current_lamports, str(e))
+            if friendly:
+                return SwapResult(success=False, error=friendly)
+        except Exception:
+            pass
         return SwapResult(success=False, error=f"Broadcast failed / simulation rejected: {e}")
 
     try:
