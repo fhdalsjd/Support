@@ -43,6 +43,14 @@ def _read_state() -> dict:
         return {}
 
 
+def _smart_sl_text(value):
+    if value is None:
+        return "—"
+    if value == 0:
+        return "BE"
+    return f"+{value:.1f}%"
+
+
 def _status() -> dict:
     state = _read_state()
     positions = state.get("positions", {})
@@ -101,8 +109,7 @@ def _page() -> bytes:
         f"<tr><td><b>${html.escape(str(p['symbol']))}</b></td><td><code>{html.escape(p['mint'])}</code></td>"
         f"<td>${p['entry_price_usd']:.8f}</td><td>{p['amount_tokens']:.6f}</td>"
         f"<td>+{p['tp']}%</td><td>-{p['sl']}%</td>"
-        f"<td>{('BE' if p['smart_sl'] == 0 else (f'+{p[\"smart_sl\"]:.1f}%' if p['smart_sl'] is not None else '—'))}</td>"
-        f"<td>+{p['peak_profit']:.1f}%</td></tr>"
+        f"<td>{_smart_sl_text(p['smart_sl'])}</td><td>+{p['peak_profit']:.1f}%</td></tr>"
         for p in s["positions"]
     ) or '<tr><td colspan="8" class="muted">No open positions</td></tr>'
 
