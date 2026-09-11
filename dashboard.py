@@ -1,8 +1,4 @@
-"""Live read-only web dashboard for the Telegram trading bot.
-
-The dashboard never exposes private keys, mnemonics, or environment values.
-It is protected with HTTP Basic Auth using DASHBOARD_USER/PASSWORD.
-"""
+"""Live read-only web dashboard for the Telegram trading bot."""
 from __future__ import annotations
 
 import base64
@@ -10,7 +6,6 @@ import hmac
 import html
 import json
 import os
-import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
@@ -81,7 +76,11 @@ def _status() -> dict:
             for mint, p in positions.items()
         ],
         "uptime_seconds": int(time.time() - STARTED_AT),
-        "auto_trading_note": "Auto-sniper toggle is present, but automatic token discovery/entry is not wired into the current bot.",
+        "auto_trading_note": (
+            "Auto-sniper is wired to live DEX Screener discovery. When the Telegram Sniper toggle is ON, "
+            "the bot checks new Solana profiles, liquidity, market cap, 5m volume/momentum, pool age, RugCheck, "
+            "and a Jupiter route/price-impact gate before an automatic buy."
+        ),
     }
 
 
@@ -99,7 +98,6 @@ def _page() -> bytes:
         for p in s["positions"]
     ) or '<tr><td colspan="6" class="muted">No open positions</td></tr>'
 
-    data = html.escape(json.dumps(s))
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Solana Bot Live Dashboard</title>
@@ -111,22 +109,22 @@ main{{max-width:1100px;margin:auto;padding:24px}} h1{{margin:0 0 6px}} .muted{{c
 .ok{{color:#52d273}} .warn{{color:#ffca5c}} .bad{{color:#ff6b6b}}
 table{{width:100%;border-collapse:collapse;background:#141821;border-radius:14px;overflow:hidden}}th,td{{padding:12px;border-bottom:1px solid #252c3a;text-align:left;font-size:13px}} th{{color:#9da7b8}}
 code{{font-size:11px}} .note{{background:#17130a;border:1px solid #4d3b13;padding:14px;border-radius:12px;margin-top:18px}}
-.small{{font-size:12px;color:#8993a5}} button{{background:#273149;color:white;border:0;padding:8px 12px;border-radius:8px;cursor:pointer}}
+.small{{font-size:12px;color:#8993a5}}
 </style></head><body><main>
 <h1>Solana Trading Bot</h1><div class="muted">Live Railway service dashboard · refreshes every 5 seconds</div>
 <div class="grid">
 <div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div>
 <div class="card"><div class="muted">Bot process</div><div class="value">{"RUNNING" if s["bot_loaded"] else "OFFLINE"}</div></div>
 <div class="card"><div class="muted">Wallet</div><div class="value">{wallet_text}</div><div class="small">{html.escape(wallet_addr)}</div></div>
-<div class="card"><div class="muted">Auto-sniper</div><div class="value">{sniper}</div><div class="small">toggle only</div></div>
+<div class="card"><div class="muted">Auto-sniper</div><div class="value">{sniper}</div><div class="small">live discovery + guarded entry</div></div>
 <div class="card"><div class="muted">Open positions</div><div class="value">{len(s["positions"])}</div></div>
 <div class="card"><div class="muted">Uptime</div><div class="value">{s["uptime_seconds"]}s</div></div>
 </div>
 <h2>Open positions</h2>
 <table><thead><tr><th>Token</th><th>Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>SL</th></tr></thead><tbody>{pos_rows}</tbody></table>
 <div class="note"><b>Auto-trading status</b><br>{html.escape(s["auto_trading_note"])}<br><br>
-The current bot can inspect a mint you send in Telegram and execute buy/sell actions, but it does <b>not</b> currently discover new tokens and automatically enter them.</div>
-<p class="small">No private key or recovery phrase is displayed by this dashboard. Last refresh: <span id="t"></span></p>
+Safety gates are deliberately conservative. The Sniper toggle remains <b>OFF</b> until you enable it in Telegram; when ON, it can spend real SOL up to the configured AUTO_SNIPER_BUY_SOL amount.</div>
+<p class="small">No private key or recovery phrase is displayed. Last refresh: <span id="t"></span></p>
 <script>document.getElementById('t').textContent=new Date().toLocaleTimeString();setTimeout(()=>location.reload(),5000);</script>
 </main></body></html>""".encode("utf-8")
 
