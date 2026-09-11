@@ -94,7 +94,7 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
                     admin_id,
                     mint,
                     pos,
-                    f"profit lock {pos.smart_stop_profit_profit_pct:+.1f}% hit (peak +{pos.peak_profit_pct:.1f}%, now {pnl_pct:+.1f}%)" if hasattr(pos, "smart_stop_profit_profit_pct") else f"profit lock {pos.smart_stop_profit_pct:+.1f}% hit (peak +{pos.peak_profit_pct:.1f}%, now {pnl_pct:+.1f}%)",
+                    f"profit lock {pos.smart_stop_profit_pct:+.1f}% hit (peak +{pos.peak_profit_pct:.1f}%, now {pnl_pct:+.1f}%)",
                 )
         except Exception as exc:
             log.warning("Smart SL check failed: %s", type(exc).__name__)
