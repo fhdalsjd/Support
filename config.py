@@ -52,6 +52,13 @@ class Settings:
     auto_sniper_poll_seconds: int = _int("AUTO_SNIPER_POLL_SECONDS", 20)
     auto_sniper_cooldown_seconds: int = _int("AUTO_SNIPER_COOLDOWN_SECONDS", 900)
 
+    # Smart SL: protect the original downside, move to break-even once proven,
+    # then lock 50% of the best profit reached. The stop only moves upward.
+    smart_sl_activation_pct: float = _float("SMART_SL_ACTIVATION_PCT", 5.0)
+    smart_sl_profit_lock_start_pct: float = _float("SMART_SL_PROFIT_LOCK_START_PCT", 10.0)
+    smart_sl_lock_ratio: float = _float("SMART_SL_LOCK_RATIO", 0.50)
+    smart_sl_ratchet_step_pct: float = _float("SMART_SL_RATCHET_STEP_PCT", 2.0)
+
     rugcheck_api: str = os.getenv("RUGCHECK_API", "https://api.rugcheck.xyz/v1")
     state_file: str = os.getenv("STATE_FILE", "./state.json")
 
@@ -66,6 +73,14 @@ class Settings:
             errs.append("Provide only ONE of WALLET_MNEMONIC / WALLET_PRIVATE_KEY_B58, not both")
         if self.auto_sniper_buy_sol <= 0 or self.auto_sniper_buy_sol > self.max_buy_sol:
             errs.append("AUTO_SNIPER_BUY_SOL must be > 0 and <= MAX_BUY_SOL")
+        if not 0 < self.smart_sl_lock_ratio <= 1:
+            errs.append("SMART_SL_LOCK_RATIO must be > 0 and <= 1")
+        if self.smart_sl_activation_pct <= 0:
+            errs.append("SMART_SL_ACTIVATION_PCT must be > 0")
+        if self.smart_sl_profit_lock_start_pct < self.smart_sl_activation_pct:
+            errs.append("SMART_SL_PROFIT_LOCK_START_PCT must be >= SMART_SL_ACTIVATION_PCT")
+        if self.smart_sl_ratchet_step_pct <= 0:
+            errs.append("SMART_SL_RATCHET_STEP_PCT must be > 0")
         if errs:
             raise RuntimeError("Config errors:\n- " + "\n- ".join(errs))
 
