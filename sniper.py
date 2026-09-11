@@ -38,6 +38,17 @@ async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
     )
 
 
+async def _buy_is_funded_safely() -> tuple[bool, float, float]:
+    """Return whether a new auto-buy leaves the protected SOL reserve intact."""
+    balance = await wallet.get_sol_balance()
+    required = (
+        settings.auto_sniper_buy_sol
+        + settings.auto_fee_reserve_sol
+        + settings.auto_safety_buffer_sol
+    )
+    return balance >= required, balance, required
+
+
 async def tick(context) -> None:
     global _last_buy_at
 
@@ -51,6 +62,17 @@ async def tick(context) -> None:
     if len(positions) >= settings.auto_sniper_max_positions:
         return
     if await _auto_exposure_sol(positions) + settings.auto_sniper_buy_sol > settings.auto_sniper_max_exposure_sol:
+        return
+
+    # Protect the SOL needed to execute future TP/SL/Smart-SL sells before
+    # doing any market discovery or spending. Never use the full wallet balance.
+    funded, balance, required = await _buy_is_funded_safely()
+    if not funded:
+        log.info(
+            "Auto-sniper waiting for fee reserve: balance=%.6f required=%.6f",
+            balance,
+            required,
+        )
         return
 
     try:
@@ -75,9 +97,6 @@ async def tick(context) -> None:
             if not overview.found or overview.price_usd <= 0:
                 continue
 
-            # HIGH means on-chain supply/authority data is available and the
-            # market provider did not hit the 30-pool coverage boundary or
-            # report a material valuation conflict.
             if overview.data_quality != "HIGH":
                 log.info(
                     "Auto-sniper blocked %s: data quality=%s warnings=%s",
@@ -136,14 +155,19 @@ async def tick(context) -> None:
             if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
                 continue
 
-            balance = await wallet.get_sol_balance()
-            reserve = max(0.002, settings.auto_sniper_buy_sol * 0.25)
-            if balance < settings.auto_sniper_buy_sol + reserve:
-                await context.bot.send_message(
-                    next(iter(settings.admin_ids)),
-                    f"⚠️ Auto-sniper paused: balance {balance:.6f} SOL is below buy + safety reserve."
+            # Re-check the wallet immediately before execution. This closes
+            # the race where another transaction spends SOL after the first
+            # balance check. The protected reserve is never spendable by the
+            # auto-buyer.
+            funded, balance, required = await _buy_is_funded_safely()
+            if not funded:
+                log.info(
+                    "Auto-sniper skipped %s: balance=%.6f required=%.6f",
+                    mint,
+                    balance,
+                    required,
                 )
-                return
+                continue
 
             before_balance = await wallet.get_token_balance(mint)
             result = await buy_token(mint, settings.auto_sniper_buy_sol, settings.auto_sniper_slippage_bps)
@@ -188,7 +212,9 @@ async def tick(context) -> None:
                 f"Liquidity: `${liquidity:,.0f}` ({overview.liquidity_mcap_pct:.1f}% of MC)\n"
                 f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}` • Trades: `{trades_5m}`\n"
                 f"Jupiter impact: `{quote.price_impact_pct:.2f}%`\n"
-                f"Amount: `{settings.auto_sniper_buy_sol}` SOL\nTx: `{result.signature}`",
+                f"Amount: `{settings.auto_sniper_buy_sol}` SOL\n"
+                f"Protected reserve: `{settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:.3f} SOL`\n"
+                f"Tx: `{result.signature}`",
                 parse_mode="Markdown",
             )
             return
