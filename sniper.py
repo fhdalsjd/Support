@@ -1,7 +1,7 @@
-"""sniper.py — opt-in Solana discovery and guarded auto-buy loop.
+"""Opt-in Solana discovery and guarded auto-buy loop.
 
-Every candidate goes through the same deterministic market/security analysis
-before a real transaction is allowed. The scanner is intentionally fail-closed.
+Auto-trading is fail-closed: the same deterministic snapshot used for the
+analysis view is used for every gate immediately before the buy.
 """
 from __future__ import annotations
 
@@ -31,19 +31,11 @@ async def _latest_profiles() -> list[dict]:
         return data if isinstance(data, list) else []
 
 
-async def _pair(mint: str) -> dict | None:
-    async with httpx.AsyncClient(timeout=10) as http:
-        r = await http.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
-        r.raise_for_status()
-        pairs = r.json().get("pairs") or []
-    sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-    return max(sol_pairs, key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0)) if sol_pairs else None
-
-
 async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
-    # Legacy/manual positions have no recorded entry_sol. Count each as one
-    # configured auto buy instead of pretending its exposure is zero.
-    return sum(max(float(getattr(p, "entry_sol", 0.0) or 0.0), settings.auto_sniper_buy_sol) for p in positions.values())
+    return sum(
+        max(float(getattr(p, "entry_sol", 0.0) or 0.0), settings.auto_sniper_buy_sol)
+        for p in positions.values()
+    )
 
 
 async def tick(context) -> None:
@@ -77,12 +69,29 @@ async def tick(context) -> None:
         _last_checked[mint] = now
 
         try:
-            pair = await _pair(mint)
-            if not pair:
-                continue
-
+            # One deterministic snapshot feeds both the analysis/risk numbers
+            # and every execution gate. No second market lookup is used.
             overview, rug, analysis = await analyze_token(mint)
             if not overview.found or overview.price_usd <= 0:
+                continue
+
+            # HIGH means on-chain supply/authority data is available and the
+            # market provider did not hit the 30-pool coverage boundary or
+            # report a material valuation conflict.
+            if overview.data_quality != "HIGH":
+                log.info(
+                    "Auto-sniper blocked %s: data quality=%s warnings=%s",
+                    mint,
+                    overview.data_quality,
+                    overview.data_warnings,
+                )
+                continue
+            if overview.market_cap <= 0 or overview.total_supply <= 0 or overview.fdv <= 0:
+                continue
+
+            if not rug.mint_authority_revoked or not rug.freeze_authority_revoked:
+                continue
+            if rug.top_holder_pct is None or rug.top_holder_pct > 10:
                 continue
 
             liquidity = overview.liquidity_usd
@@ -91,7 +100,7 @@ async def tick(context) -> None:
             change_5m = overview.change_5m
             age = overview.age_minutes
             ratio = overview.buy_sell_ratio_5m
-            trades_5m = overview.buys_5m + overview.sells_5m
+            trades_5m = overview.total_trades_5m
 
             if liquidity < settings.auto_sniper_min_liquidity_usd:
                 continue
@@ -109,11 +118,7 @@ async def tick(context) -> None:
                 continue
             if overview.sells_5m > 0 and ratio < settings.auto_sniper_min_buy_sell_ratio:
                 continue
-            if rug.top_holder_pct is None or rug.top_holder_pct > 10:
-                continue
-            if analysis.risk_score > settings.auto_sniper_max_risk_score:
-                continue
-            if rug.risk_level != "LOW" or rug.risk_score > settings.auto_sniper_max_risk_score:
+            if analysis.risk_score > settings.auto_sniper_max_risk_score or rug.risk_level != "LOW":
                 continue
 
             current_positions = await store.get_positions()
@@ -149,16 +154,19 @@ async def tick(context) -> None:
             try:
                 decimals = (await wallet.client.get_token_supply(Pubkey.from_string(mint))).value.decimals
             except Exception:
-                decimals = 9
+                decimals = overview.decimals or 9
             after_balance = await wallet.get_token_balance(mint)
             token_delta = max(0.0, after_balance - before_balance)
             if token_delta <= 0:
                 log.error("Auto-buy confirmed but token balance delta is zero for %s", mint)
-                await context.bot.send_message(next(iter(settings.admin_ids)), f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`", parse_mode="Markdown")
+                await context.bot.send_message(
+                    next(iter(settings.admin_ids)),
+                    f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`",
+                    parse_mode="Markdown",
+                )
                 return
 
-            base = pair.get("baseToken") or {}
-            symbol = base.get("symbol", overview.symbol or "?")
+            symbol = overview.symbol or "?"
             pos = Position(
                 mint=mint,
                 symbol=symbol,
@@ -176,6 +184,7 @@ async def tick(context) -> None:
                 f"🤖 *AUTO-SNIPER BUY*\n\n"
                 f"Token: `${symbol}`\nMint: `{mint}`\n"
                 f"Risk: `{analysis.risk_score}/100`\n"
+                f"Data: `{overview.data_quality}` • Pools: `{overview.pool_count}`\n"
                 f"Liquidity: `${liquidity:,.0f}` ({overview.liquidity_mcap_pct:.1f}% of MC)\n"
                 f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}` • Trades: `{trades_5m}`\n"
                 f"Jupiter impact: `{quote.price_impact_pct:.2f}%`\n"
