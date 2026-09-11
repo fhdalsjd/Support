@@ -40,6 +40,11 @@ class Settings:
     default_priority_fee_microlamports: int = _int("DEFAULT_PRIORITY_FEE_MICROLAMPORTS", 50_000)
     max_buy_sol: float = _float("MAX_BUY_SOL", 2.0)
 
+    # Auto-trading fee protection. This SOL is deliberately unavailable for
+    # new buys so TP/SL/Smart-SL sells still have a fee-paying balance.
+    auto_fee_reserve_sol: float = _float("AUTO_FEE_RESERVE_SOL", 0.005)
+    auto_safety_buffer_sol: float = _float("AUTO_SAFETY_BUFFER_SOL", 0.002)
+
     # Auto-sniper is opt-in in state.json. These limits are deliberately
     # independent from the manual MAX_BUY_SOL cap.
     auto_sniper_buy_sol: float = _float("AUTO_SNIPER_BUY_SOL", 0.01)
@@ -79,6 +84,10 @@ class Settings:
             errs.append("Provide only ONE of WALLET_MNEMONIC / WALLET_PRIVATE_KEY_B58, not both")
         if self.auto_sniper_buy_sol <= 0 or self.auto_sniper_buy_sol > self.max_buy_sol:
             errs.append("AUTO_SNIPER_BUY_SOL must be > 0 and <= MAX_BUY_SOL")
+        if self.auto_fee_reserve_sol <= 0:
+            errs.append("AUTO_FEE_RESERVE_SOL must be > 0")
+        if self.auto_safety_buffer_sol < 0:
+            errs.append("AUTO_SAFETY_BUFFER_SOL must be >= 0")
         if self.auto_sniper_max_positions < 1:
             errs.append("AUTO_SNIPER_MAX_POSITIONS must be >= 1")
         if self.auto_sniper_max_exposure_sol < self.auto_sniper_buy_sol:
