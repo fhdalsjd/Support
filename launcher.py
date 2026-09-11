@@ -41,6 +41,11 @@ if __name__ == "__main__":
     # wallet/state/security/trading modules and asyncio event loop.
     import sniper
     import smart_sl
+    import ui_compat
+
+    # Contract-address viewing is read-only and must work even before a wallet
+    # is connected. Buying/selling still enforces the wallet safety gate.
+    ui_compat.install(bot_app)
 
     # Run all trading checks from the Telegram application's asyncio event loop.
     # Smart SL runs first so a newly tightened stop can be enforced immediately.
