@@ -1,49 +1,101 @@
-import re
-from dataclasses import dataclass
+"""
+security.py — Token metadata/market data (DexScreener) + rug/security
+verdict (RugCheck) for any pasted Solana mint address.
+"""
 import httpx
-from settings import settings
+from dataclasses import dataclass
 
-MINT_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
+from config import settings
+
 
 @dataclass
-class TokenInfo:
+class TokenOverview:
     mint: str
-    name: str = "Unknown"
-    symbol: str = "?"
-    price_usd: float = 0.0
-    market_cap: float = 0.0
-    liquidity: float = 0.0
-    change_5m: float = 0.0
-    change_1h: float = 0.0
-    verdict: str = "UNKNOWN"
-    mint_authority: str = "unknown"
-    freeze_authority: str = "unknown"
-    pair_url: str = ""
+    name: str
+    symbol: str
+    price_usd: float
+    market_cap: float
+    liquidity_usd: float
+    change_5m: float
+    change_1h: float
+    dex: str
+    found: bool = True
 
-async def inspect_token(mint: str) -> TokenInfo:
-    if not MINT_RE.fullmatch(mint): raise ValueError("Invalid Solana mint address")
-    info = TokenInfo(mint=mint)
-    async with httpx.AsyncClient() as client:
-        try:
-            r = await client.get(f"{settings.dexscreener_url}/token-pairs/v1/solana/{mint}", timeout=8); r.raise_for_status()
-            pairs = r.json() if isinstance(r.json(), list) else []
-            if pairs:
-                p = max(pairs, key=lambda x: float((x.get("liquidity") or {}).get("usd") or 0))
-                base = p.get("baseToken") or {}; ch = p.get("priceChange") or {}
-                info.name = base.get("name") or info.name; info.symbol = base.get("symbol") or info.symbol
-                info.price_usd = float(p.get("priceUsd") or 0); info.market_cap = float(p.get("marketCap") or p.get("fdv") or 0)
-                info.liquidity = float((p.get("liquidity") or {}).get("usd") or 0); info.change_5m = float(ch.get("m5") or 0); info.change_1h = float(ch.get("h1") or 0)
-                info.pair_url = p.get("url") or ""
-        except Exception: pass
-        try:
-            r = await client.get(f"{settings.rugcheck_url}/v1/tokens/{mint}/report", timeout=8); r.raise_for_status(); rc=r.json()
-            risks = rc.get("risks") or []
-            info.verdict = "RISK" if any((x.get("level") or "").lower() in {"danger","critical","high"} for x in risks) else "PASS"
-            tm=rc.get("tokenMeta") or {}; info.mint_authority="set" if (tm.get("mintAuthority") or rc.get("mintAuthority")) else "disabled/unknown"; info.freeze_authority="set" if (tm.get("freezeAuthority") or rc.get("freezeAuthority")) else "disabled/unknown"
-        except Exception: info.verdict="UNAVAILABLE"
-    return info
 
-def format_token(i: TokenInfo) -> str:
-    return (f"🪙 <b>{i.name}</b> <code>${i.symbol}</code>\nCA: <code>{i.mint}</code>\nPrice: ${i.price_usd:.8g}\n"
-            f"Market Cap: ${i.market_cap:,.0f}\nLiquidity: ${i.liquidity:,.0f}\n5m: {i.change_5m:+.2f}% | 1h: {i.change_1h:+.2f}%\n"
-            f"RugCheck: <b>{i.verdict}</b> | Mint: {i.mint_authority} | Freeze: {i.freeze_authority}")
+@dataclass
+class RugVerdict:
+    mint_authority_revoked: bool
+    freeze_authority_revoked: bool
+    top_holder_pct: float | None
+    risk_level: str          # "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN"
+    notes: list[str]
+
+
+async def get_token_overview(mint: str) -> TokenOverview:
+    async with httpx.AsyncClient(timeout=10) as http:
+        r = await http.get(f"https://api.dexscreener.com/latest/dex/tokens/{mint}")
+        r.raise_for_status()
+        data = r.json()
+        pairs = data.get("pairs") or []
+        if not pairs:
+            return TokenOverview(mint, "Unknown", "?", 0, 0, 0, 0, 0, "-", found=False)
+
+        # Pick the highest-liquidity pair as the canonical price source
+        best = max(pairs, key=lambda p: float(p.get("liquidity", {}).get("usd") or 0))
+        base = best.get("baseToken", {})
+        return TokenOverview(
+            mint=mint,
+            name=base.get("name", "Unknown"),
+            symbol=base.get("symbol", "?"),
+            price_usd=float(best.get("priceUsd") or 0),
+            market_cap=float(best.get("fdv") or 0),
+            liquidity_usd=float(best.get("liquidity", {}).get("usd") or 0),
+            change_5m=float(best.get("priceChange", {}).get("m5") or 0),
+            change_1h=float(best.get("priceChange", {}).get("h1") or 0),
+            dex=best.get("dexId", "-"),
+        )
+
+
+async def get_rug_verdict(mint: str) -> RugVerdict:
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(f"{settings.rugcheck_api}/tokens/{mint}/report")
+            if r.status_code != 200:
+                return RugVerdict(False, False, None, "UNKNOWN", ["RugCheck data unavailable — verify manually"])
+            data = r.json()
+
+        mint_auth = data.get("mintAuthority")
+        freeze_auth = data.get("freezeAuthority")
+        mint_revoked = mint_auth is None
+        freeze_revoked = freeze_auth is None
+
+        top_pct = None
+        holders = data.get("topHolders") or []
+        if holders:
+            top_pct = sum(h.get("pct", 0) for h in holders[:1])
+
+        notes = []
+        risk_score = 0
+        if not mint_revoked:
+            notes.append("⚠️ Mint authority NOT revoked — supply can be inflated")
+            risk_score += 2
+        if not freeze_revoked:
+            notes.append("⚠️ Freeze authority NOT revoked — your tokens could be frozen")
+            risk_score += 2
+        if top_pct and top_pct > 20:
+            notes.append(f"⚠️ Top holder owns {top_pct:.1f}% of supply")
+            risk_score += 1
+        if not notes:
+            notes.append("No major red flags found in automated check")
+
+        risk_level = "HIGH" if risk_score >= 3 else "MEDIUM" if risk_score >= 1 else "LOW"
+
+        return RugVerdict(
+            mint_authority_revoked=mint_revoked,
+            freeze_authority_revoked=freeze_revoked,
+            top_holder_pct=top_pct,
+            risk_level=risk_level,
+            notes=notes,
+        )
+    except Exception as e:
+        return RugVerdict(False, False, None, "UNKNOWN", [f"RugCheck lookup failed: {e}"])
