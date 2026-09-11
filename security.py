@@ -1,9 +1,10 @@
-"""
-security.py — market data + deterministic risk analysis shared by the UI and
-auto-trader. The bot never presents the score as a guarantee; it is a hard
-filter built from observable market/security signals.
+"""Market data and deterministic security/risk analysis shared by the bot UI and auto-trader.
+
+Risk score is 0–100 where 0 is safest. It is a filter, not a prediction or
+profit guarantee. Missing critical security data fails closed for automation.
 """
 from dataclasses import dataclass
+import time
 import httpx
 
 from config import settings
@@ -39,14 +40,11 @@ class TokenOverview:
     def age_minutes(self) -> float | None:
         if not self.pair_created_at_ms:
             return None
-        import time
         return max(0.0, (time.time() * 1000 - self.pair_created_at_ms) / 60000.0)
 
     @property
     def liquidity_mcap_pct(self) -> float:
-        if self.market_cap <= 0:
-            return 0.0
-        return self.liquidity_usd / self.market_cap * 100.0
+        return self.liquidity_usd / self.market_cap * 100.0 if self.market_cap > 0 else 0.0
 
     @property
     def buy_sell_ratio_5m(self) -> float:
@@ -99,9 +97,6 @@ async def get_token_overview(mint: str) -> TokenOverview:
             pairs = [p for p in (data.get("pairs") or []) if p.get("chainId") == "solana"]
             if not pairs:
                 return TokenOverview(mint, "Unknown", "?", 0, 0, 0, 0, 0, "-", found=False)
-
-            # One canonical pair prevents the UI and auto-trader from using
-            # different prices for the same token. Prefer deepest liquidity.
             best = max(pairs, key=lambda p: _f((p.get("liquidity") or {}).get("usd")))
             base = best.get("baseToken") or {}
             tx5 = (best.get("txns") or {}).get("m5") or {}
@@ -138,10 +133,9 @@ async def get_token_overview(mint: str) -> TokenOverview:
         return TokenOverview(mint, "Unknown", "?", 0, 0, 0, 0, 0, "-", found=False)
 
 
-def _risk_from_market(o: TokenOverview) -> tuple[int, list[str], int, int, int, int]:
+def _market_risk(o: TokenOverview) -> tuple[int, list[str], int, int, int, int]:
     risk = 0
     reasons: list[str] = []
-
     if o.liquidity_usd < 10_000:
         risk += 25; reasons.append("Very low liquidity")
     elif o.liquidity_usd < 25_000:
@@ -150,9 +144,9 @@ def _risk_from_market(o: TokenOverview) -> tuple[int, list[str], int, int, int, 
     if o.market_cap <= 0:
         risk += 20; reasons.append("Market cap unavailable")
     elif o.liquidity_mcap_pct < 5:
-        risk += 15; reasons.append(f"Thin liquidity ({o.liquidity_mcap_pct:.1f}% of market cap)")
+        risk += 15; reasons.append(f"Thin liquidity ({o.liquidity_mcap_pct:.1f}% of MC)")
     elif o.liquidity_mcap_pct < 8:
-        risk += 7; reasons.append(f"Moderate liquidity ({o.liquidity_mcap_pct:.1f}% of market cap)")
+        risk += 7; reasons.append(f"Moderate liquidity ({o.liquidity_mcap_pct:.1f}% of MC)")
 
     if o.volume_5m < 500:
         risk += 15; reasons.append("Very low 5m volume")
@@ -181,54 +175,20 @@ def _risk_from_market(o: TokenOverview) -> tuple[int, list[str], int, int, int, 
         risk += 6; reasons.append("Pool has limited trading history")
 
     risk = min(100, max(0, int(risk)))
-    risk_level = "LOW" if risk <= 20 else "MEDIUM" if risk <= 45 else "HIGH"
-
-    momentum = 50
-    momentum += max(-30, min(30, o.change_5m * 1.2))
-    momentum += max(-20, min(20, o.change_1h * 0.4))
-    momentum = int(max(0, min(100, momentum)))
-
+    momentum = int(max(0, min(100, 50 + max(-30, min(30, o.change_5m * 1.2)) + max(-20, min(20, o.change_1h * 0.4)))))
     liquidity_score = int(max(0, min(100, o.liquidity_mcap_pct * 5)))
     flow_score = int(max(0, min(100, 50 + (ratio - 1) * 25))) if o.sells_5m else 60
     age_score = 70 if age is not None and 10 <= age <= 1440 else 40
     return risk, reasons, momentum, liquidity_score, flow_score, age_score
 
 
-async def analyze_token(mint: str) -> tuple[TokenOverview, RugVerdict, TradeAnalysis]:
-    overview = await get_token_overview(mint)
-    rug = await get_rug_verdict(mint)
-    market_risk, reasons, momentum, liquidity, flow, age = _risk_from_market(overview)
-
-    security_risk = 0
-    if not rug.mint_authority_revoked:
-        security_risk += 20; reasons.append("Mint authority is active")
-    if not rug.freeze_authority_revoked:
-        security_risk += 20; reasons.append("Freeze authority is active")
-    if rug.top_holder_pct is not None:
-        if rug.top_holder_pct > 20:
-            security_risk += 15; reasons.append(f"Top holder concentration {rug.top_holder_pct:.1f}%")
-        elif rug.top_holder_pct > 10:
-            security_risk += 7; reasons.append(f"Top holder concentration {rug.top_holder_pct:.1f}%")
-    if rug.risk_level == "UNKNOWN":
-        security_risk += 30; reasons.append("RugCheck unavailable")
-
-    total = min(100, market_risk + security_risk)
-    level = "LOW" if total <= 20 else "MEDIUM" if total <= 45 else "HIGH"
-    analysis = TradeAnalysis(total, level, momentum, liquidity, flow, age, reasons[:10])
-    rug.risk_score = total
-    rug.risk_level = level
-    if not rug.notes:
-        rug.notes = []
-    rug.notes = [f"Risk score: {total}/100 ({level})"] + reasons[:4] + rug.notes[:2]
-    return overview, rug, analysis
-
-
 async def get_rug_verdict(mint: str) -> RugVerdict:
+    """Return security risk plus the same market-risk components used by automation."""
     try:
         async with httpx.AsyncClient(timeout=10) as http:
             r = await http.get(f"{settings.rugcheck_api}/tokens/{mint}/report")
             if r.status_code != 200:
-                return RugVerdict(False, False, None, "UNKNOWN", ["RugCheck data unavailable — verify manually"], 100)
+                return RugVerdict(False, False, None, "UNKNOWN", ["RugCheck unavailable — automatic trading blocked"], 100)
             data = r.json()
 
         mint_auth = data.get("mintAuthority")
@@ -241,24 +201,50 @@ async def get_rug_verdict(mint: str) -> RugVerdict:
             try:
                 top_pct = float(holders[0].get("pct", 0))
             except (TypeError, ValueError):
-                top_pct = None
+                pass
 
-        notes = []
+        notes: list[str] = []
+        security_risk = 0
         if not mint_revoked:
-            notes.append("⚠️ Mint authority NOT revoked — supply can be inflated")
+            security_risk += 20; notes.append("⚠️ Mint authority NOT revoked")
         if not freeze_revoked:
-            notes.append("⚠️ Freeze authority NOT revoked — tokens could be frozen")
+            security_risk += 20; notes.append("⚠️ Freeze authority NOT revoked")
         if top_pct and top_pct > 20:
-            notes.append(f"⚠️ Top holder owns {top_pct:.1f}% of supply")
-        if not notes:
-            notes.append("No major authority/holder red flags found in automated check")
+            security_risk += 15; notes.append(f"⚠️ Top holder concentration {top_pct:.1f}%")
+        elif top_pct and top_pct > 10:
+            security_risk += 7; notes.append(f"⚠️ Top holder concentration {top_pct:.1f}%")
 
-        score = 0
-        if not mint_revoked: score += 20
-        if not freeze_revoked: score += 20
-        if top_pct and top_pct > 20: score += 15
-        elif top_pct and top_pct > 10: score += 7
+        overview = await get_token_overview(mint)
+        if not overview.found:
+            return RugVerdict(mint_revoked, freeze_revoked, top_pct, "UNKNOWN", notes + ["Market data unavailable — automatic trading blocked"], 100)
+        market_risk, reasons, _, _, _, _ = _market_risk(overview)
+        score = min(100, security_risk + market_risk)
         level = "LOW" if score <= 20 else "MEDIUM" if score <= 45 else "HIGH"
+        notes = [f"Risk score: {score}/100 ({level})"]
+        notes.append(f"Liquidity/MC: {overview.liquidity_mcap_pct:.1f}% • 5m volume: ${overview.volume_5m:,.0f}")
+        notes.append(f"5m: {overview.change_5m:+.1f}% • Buy/Sell: {overview.buy_sell_ratio_5m:.2f}")
+        if overview.age_minutes is not None:
+            notes.append(f"Pool age: {overview.age_minutes:.0f} min")
+        notes.extend(reasons[:4])
         return RugVerdict(mint_revoked, freeze_revoked, top_pct, level, notes, score)
     except Exception:
-        return RugVerdict(False, False, None, "UNKNOWN", ["RugCheck lookup failed — verify manually"], 100)
+        return RugVerdict(False, False, None, "UNKNOWN", ["RugCheck lookup failed — automatic trading blocked"], 100)
+
+
+async def analyze_token(mint: str) -> tuple[TokenOverview, RugVerdict, TradeAnalysis]:
+    overview = await get_token_overview(mint)
+    rug = await get_rug_verdict(mint)
+    if not overview.found or rug.risk_level == "UNKNOWN":
+        analysis = TradeAnalysis(100, "HIGH", 0, 0, 0, 0, ["Critical market/security data unavailable"])
+        return overview, rug, analysis
+
+    market_risk, reasons, momentum, liquidity, flow, age = _market_risk(overview)
+    # get_rug_verdict already contains the same market component; recover only
+    # the security component so the final score is not double-counted.
+    security_component = max(0, rug.risk_score - market_risk)
+    total = min(100, security_component + market_risk)
+    level = "LOW" if total <= 20 else "MEDIUM" if total <= 45 else "HIGH"
+    analysis = TradeAnalysis(total, level, momentum, liquidity, flow, age, reasons[:10] + rug.notes[:4])
+    rug.risk_score = total
+    rug.risk_level = level
+    return overview, rug, analysis
