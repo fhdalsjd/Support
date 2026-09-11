@@ -41,7 +41,9 @@ async def _pair(mint: str) -> dict | None:
 
 
 async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
-    return sum(max(0.0, float(getattr(p, "entry_sol", 0.0) or 0.0)) for p in positions.values())
+    # Legacy/manual positions have no recorded entry_sol. Count each as one
+    # configured auto buy instead of pretending its exposure is zero.
+    return sum(max(float(getattr(p, "entry_sol", 0.0) or 0.0), settings.auto_sniper_buy_sol) for p in positions.values())
 
 
 async def tick(context) -> None:
@@ -107,8 +109,6 @@ async def tick(context) -> None:
                 continue
             if overview.sells_5m > 0 and ratio < settings.auto_sniper_min_buy_sell_ratio:
                 continue
-            # A single whale can dominate a tiny memecoin even when the
-            # aggregate risk score looks acceptable; automation rejects >10%.
             if rug.top_holder_pct is None or rug.top_holder_pct > 10:
                 continue
             if analysis.risk_score > settings.auto_sniper_max_risk_score:
