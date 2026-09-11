@@ -5,6 +5,7 @@ import importlib.util
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 
 import dashboard
@@ -33,6 +34,83 @@ def run_dashboard() -> None:
         raise
 
 
+def _snapshot_from_overview(overview, *, source: str, allocation_pct=None, trade_amount=None, price_impact=None, risk=None, rug=None) -> dict:
+    """Freeze market/security data at entry so history is not overwritten by later market changes."""
+    return {
+        "source": source,
+        "allocation_pct": allocation_pct,
+        "trade_amount_sol": trade_amount,
+        "price_impact_pct": price_impact,
+        "risk_score": getattr(risk, "risk_score", None),
+        "risk_level": getattr(rug, "risk_level", None),
+        "rug_notes": list(getattr(rug, "notes", []) or []),
+        "price_usd": overview.price_usd,
+        "market_cap_usd": overview.market_cap,
+        "fdv_usd": overview.fdv,
+        "liquidity_usd": overview.liquidity_usd,
+        "volume_5m_usd": overview.volume_5m,
+        "volume_24h_usd": overview.volume_24h,
+        "trades_5m": overview.total_trades_5m,
+        "trades_24h": overview.total_trades_24h,
+        "buy_sell_ratio_5m": overview.buy_sell_ratio_5m,
+        "change_5m_pct": overview.change_5m,
+        "change_1h_pct": overview.change_1h,
+        "pool_age_minutes": overview.age_minutes,
+        "primary_pool_age_minutes": getattr(overview, "primary_pool_age_minutes", None),
+        "oldest_pool_age_minutes": getattr(overview, "oldest_pool_age_minutes", None),
+        "pool_count": overview.pool_count,
+        "dex": overview.dex,
+        "decimals": overview.decimals,
+        "total_supply": overview.total_supply,
+        "mint_authority": getattr(overview, "mint_authority", None),
+        "freeze_authority": getattr(overview, "freeze_authority", None),
+        "top_holder_pct": getattr(overview, "top_holder_pct", None),
+        "data_quality": overview.data_quality,
+        "data_warnings": list(getattr(overview, "data_warnings", []) or []),
+        "market_cap_source": getattr(overview, "market_cap_source", None),
+        "data_source": getattr(overview, "data_source", None),
+        "fetched_at": getattr(overview, "fetched_at", None),
+    }
+
+
+async def _save_closed_trade(bot_app, pos, mint: str, signature: str, reason: str, exit_price_usd: float | None = None, exit_tokens: float | None = None):
+    """Write a permanent audit record before removing a fully closed position."""
+    if exit_price_usd is None:
+        try:
+            overview = await bot_app.get_token_overview(mint)
+            exit_price_usd = overview.price_usd if overview.found else None
+        except Exception:
+            exit_price_usd = None
+    entry_price = float(pos.entry_price_usd or 0.0)
+    pnl_pct = ((exit_price_usd - entry_price) / entry_price * 100.0) if exit_price_usd and entry_price else None
+    entry_sol = float(pos.entry_sol or 0.0)
+    pnl_sol = entry_sol * pnl_pct / 100.0 if pnl_pct is not None else None
+    record = {
+        "closed_at": time.time(),
+        "opened_at": pos.opened_at or None,
+        "mint": mint,
+        "symbol": pos.symbol,
+        "decimals": pos.decimals,
+        "entry_price_usd": entry_price,
+        "exit_price_usd": exit_price_usd,
+        "entry_sol": entry_sol,
+        "pnl_pct": pnl_pct,
+        "pnl_sol_estimate": pnl_sol,
+        "amount_tokens": pos.amount_tokens,
+        "exit_tokens": exit_tokens if exit_tokens is not None else pos.amount_tokens,
+        "take_profit_pct": pos.take_profit_pct,
+        "stop_loss_pct": pos.stop_loss_pct,
+        "peak_profit_pct": pos.peak_profit_pct,
+        "smart_stop_profit_pct": pos.smart_stop_profit_pct,
+        "close_reason": reason,
+        "buy_signature": pos.buy_signature,
+        "sell_signature": signature,
+        "entry_snapshot": dict(pos.entry_snapshot or {}),
+        "close_events": list(pos.close_events or []),
+    }
+    await bot_app.store.append_history(record)
+
+
 if __name__ == "__main__":
     bot_app = load_bot_module()
     log.info("Loaded Telegram bot from %s; main=%s", BOT_PATH, hasattr(bot_app, "main"))
@@ -56,8 +134,14 @@ if __name__ == "__main__":
                 return
             result = await sell_token(mint, raw_units, pos.decimals)
             if result.success:
+                try:
+                    overview = await bot_app.get_token_overview(mint)
+                    exit_price = overview.price_usd if overview.found else None
+                except Exception:
+                    exit_price = None
+                await _save_closed_trade(bot_app, pos, mint, result.signature, reason, exit_price, balance)
                 await bot_app.store.remove_position(mint)
-                await context.bot.send_message(admin_id, f"🤖 Auto-closed *${pos.symbol}* — {reason}\nTx: `{result.signature}`", parse_mode="Markdown")
+                await context.bot.send_message(admin_id, f"🤖 Auto-closed *${pos.symbol}* — {reason}\nPnL: `{(((exit_price - pos.entry_price_usd) / pos.entry_price_usd) * 100):+.2f}%` if exit_price and pos.entry_price_usd else 'unavailable'}`\nTx: `{result.signature}`", parse_mode="Markdown")
             else:
                 await context.bot.send_message(admin_id, f"⚠️ Auto-close FAILED for ${pos.symbol}: {result.error}")
         except Exception as exc:
@@ -91,9 +175,29 @@ if __name__ == "__main__":
             if not result.success:
                 await notice.edit_text(result.error or "❌ Sell failed")
                 return
-            await bot_app.store.reduce_position_amount(mint, raw_units / (10 ** pos.decimals))
+            try:
+                overview = await bot_app.get_token_overview(mint)
+                exit_price = overview.price_usd if overview.found else None
+            except Exception:
+                exit_price = None
+            close_event = {
+                "closed_at": time.time(),
+                "fraction": fraction,
+                "tokens": sell_balance,
+                "exit_price_usd": exit_price,
+                "sell_signature": result.signature,
+                "reason": "MANUAL_CLOSE" if fraction < 0.999999 else "MANUAL_CLOSE_FULL",
+            }
+            pos.close_events = list(pos.close_events or []) + [close_event]
+            if fraction >= 0.999999:
+                await _save_closed_trade(bot_app, pos, mint, result.signature, "MANUAL_CLOSE", exit_price, sell_balance)
+            else:
+                await bot_app.store.upsert_position(pos)
+            await bot_app.store.reduce_position_amount(mint, sell_balance)
             label = "Closed 100%" if fraction >= 0.999999 else f"Sold {fraction * 100:g}%"
-            await notice.edit_text(f"✅ {label} of ${pos.symbol}\nTx: `{result.signature}`", parse_mode="Markdown")
+            pnl = ((exit_price - pos.entry_price_usd) / pos.entry_price_usd * 100) if exit_price and pos.entry_price_usd else None
+            pnl_text = f"\nPnL at exit: `{pnl:+.2f}%`" if pnl is not None else ""
+            await notice.edit_text(f"✅ {label} of ${pos.symbol}{pnl_text}\nTx: `{result.signature}`\n\n📚 Saved to trade history.", parse_mode="Markdown")
         except Exception as exc:
             log.exception("Manual sell failed: %s", type(exc).__name__)
             await notice.edit_text("❌ Sell failed due to a temporary error.")
@@ -127,15 +231,18 @@ if __name__ == "__main__":
             try:
                 decimals = (await bot_app.wallet.client.get_token_supply(Pubkey.from_string(mint))).value.decimals
             except Exception:
-                decimals = 9
+                decimals = overview.decimals or 9
             st = await bot_app.store.get_settings()
             old = (await bot_app.store.get_positions()).get(mint)
+            snapshot = _snapshot_from_overview(overview, source="manual", trade_amount=sol_amount)
             if old:
                 total_tokens = old.amount_tokens + token_delta
                 old.entry_price_usd = ((old.entry_price_usd * old.amount_tokens) + (overview.price_usd * token_delta)) / total_tokens
                 old.amount_tokens = total_tokens
                 old.entry_sol = (old.entry_sol or 0.0) + sol_amount
                 old.decimals = decimals
+                old.close_events = list(old.close_events or [])
+                old.entry_snapshot = {**(old.entry_snapshot or {}), "last_add": snapshot}
                 await bot_app.store.upsert_position(old)
             else:
                 pos = bot_app.Position(
@@ -147,17 +254,24 @@ if __name__ == "__main__":
                     take_profit_pct=st["default_tp_pct"],
                     stop_loss_pct=st["default_sl_pct"],
                     entry_sol=sol_amount,
+                    opened_at=time.time(),
+                    buy_signature=result.signature,
+                    entry_snapshot=snapshot,
                 )
                 await bot_app.store.upsert_position(pos)
-            await notice.edit_text(f"✅ *Bought ${overview.symbol}*\nAmount: `{sol_amount:.9f} SOL`\nTokens received: `{token_delta:.8g}`\nTx: `{result.signature}`\n\n📊 Position accounting uses the actual token balance delta.", parse_mode="Markdown")
+            await notice.edit_text(
+                f"✅ *Position OPEN — ${overview.symbol}*\n\nCA / Mint: `{mint}`\nEntry: `${overview.price_usd:.10f}`\nTokens: `{token_delta:.8g}`\nSpend: `{sol_amount:.9f} SOL`\n"
+                f"Liquidity: `${overview.liquidity_usd:,.0f}` • MC: `${overview.market_cap:,.0f}` • FDV: `${overview.fdv:,.0f}`\n"
+                f"5m volume: `${overview.volume_5m:,.0f}` • 5m trades: `{overview.total_trades_5m}`\nRisk data: `{overview.data_quality}` • Pools: `{overview.pool_count}`\n"
+                f"TP: `+{st['default_tp_pct']}%` • Hard SL: `-{st['default_sl_pct']}%`\nBuy Tx: `{result.signature}`\n\n📚 Position details saved. Live PnL is available from the dashboard.",
+                parse_mode="Markdown",
+            )
         except Exception as exc:
             log.exception("Buy failed: %s", type(exc).__name__)
             await notice.edit_text("❌ Buy failed due to a temporary error. No wallet credential was exposed.")
 
     bot_app.do_buy = safe_do_buy
 
-    # Replace only the callback router so the admin must explicitly choose and
-    # confirm a per-trade allocation before auto-sniper can spend anything.
     original_callback_router = bot_app.callback_router
 
     async def guarded_callback_router(update, context):
@@ -177,10 +291,7 @@ if __name__ == "__main__":
                 await query.edit_message_text("🔴 *Auto-Sniper OFF*\n\nNo automatic buys are running.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Dashboard", callback_data="refresh_dashboard")]]))
                 return
             await query.edit_message_text(
-                "🎯 *Enable Auto-Sniper*\n\n"
-                "Choose what percentage of your *spendable SOL* each new trade may use.\n\n"
-                "The fee reserve and safety buffer are never included in this percentage.\n\n"
-                "Choose a trade allocation:",
+                "🎯 *Enable Auto-Sniper*\n\nChoose what percentage of your *spendable SOL* each new trade may use.\n\nThe fee reserve and safety buffer are never included in this percentage.\n\nChoose a trade allocation:",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("75%", callback_data="sniperpct:75"), InlineKeyboardButton("65%", callback_data="sniperpct:65")],
@@ -197,13 +308,7 @@ if __name__ == "__main__":
             spendable = max(0.0, balance - bot_app.settings.auto_fee_reserve_sol - bot_app.settings.auto_safety_buffer_sol)
             estimated = min(spendable * pct / 100.0, bot_app.settings.max_buy_sol)
             await query.edit_message_text(
-                f"🎯 *Confirm Auto-Sniper*\n\n"
-                f"Allocation: *{pct:g}%* of spendable SOL\n"
-                f"Wallet: `{balance:.6f} SOL`\n"
-                f"Protected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\n"
-                f"Spendable now: `{spendable:.6f} SOL`\n"
-                f"Estimated trade amount: `{estimated:.9f} SOL`\n\n"
-                "The amount is recalculated from the live wallet balance before every trade.",
+                f"🎯 *Confirm Auto-Sniper*\n\nAllocation: *{pct:g}%* of spendable SOL\nWallet: `{balance:.6f} SOL`\nProtected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\nSpendable now: `{spendable:.6f} SOL`\nEstimated trade amount: `{estimated:.9f} SOL`\n\nThe amount is recalculated from the live wallet balance before every trade.",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Confirm & Enable", callback_data=f"sniperconfirm:{pct:g}"), InlineKeyboardButton("⬅ Change", callback_data="toggle_sniper")],
@@ -223,11 +328,7 @@ if __name__ == "__main__":
             balance = await bot_app.wallet.get_sol_balance() if bot_app.wallet.configured else 0.0
             spendable = max(0.0, balance - bot_app.settings.auto_fee_reserve_sol - bot_app.settings.auto_safety_buffer_sol)
             estimated = min(spendable * pct / 100.0, bot_app.settings.max_buy_sol)
-            await query.edit_message_text(
-                f"🟢 *Auto-Sniper ON*\n\nAllocation: `{pct:g}%` of spendable SOL per trade\nCurrent estimated trade: `{estimated:.9f} SOL`\nProtected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\n\nLive balance is rechecked before every buy.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Turn Sniper OFF", callback_data="toggle_sniper")], [InlineKeyboardButton("🏠 Dashboard", callback_data="refresh_dashboard")]]),
-            )
+            await query.edit_message_text(f"🟢 *Auto-Sniper ON*\n\nAllocation: `{pct:g}%` of spendable SOL per trade\nCurrent estimated trade: `{estimated:.9f} SOL`\nProtected reserve: `{bot_app.settings.auto_fee_reserve_sol + bot_app.settings.auto_safety_buffer_sol:.6f} SOL`\n\nLive balance is rechecked before every buy.", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔴 Turn Sniper OFF", callback_data="toggle_sniper")], [InlineKeyboardButton("🏠 Dashboard", callback_data="refresh_dashboard")]]))
             return
 
         if data == "snipercancel":
