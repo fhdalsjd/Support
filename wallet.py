@@ -1,105 +1,100 @@
+"""
+wallet.py — Keypair loading (mnemonic OR raw private key), balance queries,
+and low-level transaction signing/sending helpers.
+
+SECURITY NOTES
+- The keypair is derived once at process start and held in memory only.
+- Never log the mnemonic, private key, or raw keypair bytes.
+- Recommend a dedicated burner wallet funded only with risk capital.
+"""
 import base58
-import base64
 import httpx
+from bip_utils import (
+    Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
+)
 from solders.keypair import Keypair
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
-from settings import settings
+from solana.rpc.async_api import AsyncClient
+from solana.rpc.commitment import Confirmed
 
-LAMPORTS_PER_SOL = 1_000_000_000
+from config import settings
+
+SOL_DECIMALS = 9
+LAMPORTS_PER_SOL = 10**9
+
+# Standard Solana derivation path: m/44'/501'/0'/0'
+SOLANA_DERIVATION_ACCOUNT = 0
+
+
+def _keypair_from_mnemonic(mnemonic: str) -> Keypair:
+    seed_bytes = Bip39SeedGenerator(mnemonic).Generate()
+    bip44 = Bip44.FromSeed(seed_bytes, Bip44Coins.SOLANA).Purpose().Coin()
+    account = bip44.Account(SOLANA_DERIVATION_ACCOUNT).Change(Bip44Changes.CHAIN_EXT)
+    priv_key_bytes = account.PrivateKey().Raw().ToBytes()
+    return Keypair.from_seed(priv_key_bytes)
+
+
+def _keypair_from_b58(key_b58: str) -> Keypair:
+    raw = base58.b58decode(key_b58)
+    return Keypair.from_bytes(raw)
+
+
+def load_keypair() -> Keypair:
+    if settings.wallet_mnemonic:
+        return _keypair_from_mnemonic(settings.wallet_mnemonic)
+    if settings.wallet_private_key_b58:
+        return _keypair_from_b58(settings.wallet_private_key_b58)
+    raise RuntimeError("No wallet credentials configured")
 
 
 class Wallet:
-    """Wallet wrapper.
-
-    Startup never requires a private key. This is important because the bot's
-    Telegram UI can start before a wallet is connected/configured.
-    Secrets, when used for automated trading, are loaded only from Railway
-    environment variables and transactions are signed locally.
-    """
+    """Thin async wrapper around the signing keypair + RPC client."""
 
     def __init__(self):
-        self.keypair: Keypair | None = None
-        self.rpc_url = settings.rpc_url
-
-    def _load(self) -> Keypair:
-        if settings.wallet_private_key:
-            try:
-                raw = base58.b58decode(settings.wallet_private_key.strip())
-            except Exception as exc:
-                raise RuntimeError("WALLET_PRIVATE_KEY is not valid Base58") from exc
-            if len(raw) == 64:
-                return Keypair.from_bytes(raw)
-            if len(raw) == 32:
-                return Keypair.from_seed(raw)
-            raise RuntimeError("WALLET_PRIVATE_KEY must decode to 32 or 64 bytes")
-
-        if settings.wallet_mnemonic:
-            try:
-                from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins
-            except ImportError as exc:
-                raise RuntimeError("Install bip-utils to use WALLET_MNEMONIC") from exc
-            seed = Bip39SeedGenerator(settings.wallet_mnemonic).Generate()
-            node = Bip44.FromSeed(seed, Bip44Coins.SOLANA).DeriveDefaultPath()
-            return Keypair.from_seed(node.PrivateKey().Raw().ToBytes())
-
-        if settings.generate_burner:
-            kp = Keypair()
-            print(f"[BURNER] Generated wallet: {kp.pubkey()}")
-            return kp
-
-        raise RuntimeError("Wallet not connected/configured")
-
-    def connect_from_environment(self) -> Pubkey:
-        """Load the configured automated-trading wallet on demand."""
-        if self.keypair is None:
-            self.keypair = self._load()
-        return self.keypair.pubkey()
-
-    @property
-    def connected(self) -> bool:
-        return self.keypair is not None
-
-    @property
-    def pubkey(self) -> Pubkey:
-        if self.keypair is None:
-            raise RuntimeError("Wallet not connected")
-        return self.keypair.pubkey()
+        self.keypair: Keypair = load_keypair()
+        self.pubkey: Pubkey = self.keypair.pubkey()
+        self.client = AsyncClient(settings.rpc_url, commitment=Confirmed)
 
     def short_address(self) -> str:
-        address = str(self.pubkey)
-        return f"{address[:5]}…{address[-5:]}"
+        s = str(self.pubkey)
+        return f"{s[:4]}...{s[-4:]}"
 
-    async def _rpc(self, method: str, params: list):
-        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.post(self.rpc_url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-        if "error" in data:
-            raise RuntimeError(str(data["error"]))
-        return data.get("result")
+    async def get_sol_balance(self) -> float:
+        resp = await self.client.get_balance(self.pubkey, commitment=Confirmed)
+        lamports = resp.value
+        return lamports / LAMPORTS_PER_SOL
 
-    async def balance_sol_async(self) -> float:
-        address = str(self.pubkey)
-        result = await self._rpc("getBalance", [address, {"commitment": "confirmed"}])
-        return result["value"] / LAMPORTS_PER_SOL
+    async def get_sol_usd_price(self) -> float:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(
+                settings.jupiter_price_api + "/price",
+                params={"ids": "So11111111111111111111111111111111111111112"},
+            )
+            r.raise_for_status()
+            data = r.json()
+            return float(data["data"]["So11111111111111111111111111111111111111112"]["price"])
 
-    def sign(self, raw_tx: bytes) -> bytes:
-        if self.keypair is None:
-            raise RuntimeError("Wallet not connected")
-        tx = VersionedTransaction.from_bytes(raw_tx)
-        signed = VersionedTransaction(tx.message, [self.keypair])
-        return bytes(signed)
+    async def get_token_balance(self, mint: str) -> float:
+        """Returns UI (human-readable) balance of an SPL token for this wallet."""
+        opts = {"mint": mint}
+        resp = await self.client.get_token_accounts_by_owner_json_parsed(self.pubkey, opts)
+        total = 0.0
+        for acct in resp.value:
+            info = acct.account.data.parsed["info"]
+            total += float(info["tokenAmount"]["uiAmount"] or 0)
+        return total
 
-    async def send_raw(self, raw_tx: bytes) -> str:
-        encoded = base64.b64encode(raw_tx).decode("ascii")
-        result = await self._rpc(
-            "sendTransaction",
-            [encoded, {"encoding": "base64", "skipPreflight": False, "maxRetries": 2}],
-        )
-        return str(result)
+    def sign_transaction(self, tx: VersionedTransaction) -> VersionedTransaction:
+        """Signs a versioned transaction in place using our keypair."""
+        message_bytes = bytes(tx.message)
+        signature = self.keypair.sign_message(message_bytes)
+        tx.signatures[0] = signature
+        return tx
+
+    async def close(self):
+        await self.client.close()
 
 
-# Lazy wallet: importing bot.py must never crash because no wallet secret is set.
+# Singleton — one wallet instance for the whole bot process.
 wallet = Wallet()
