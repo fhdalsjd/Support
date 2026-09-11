@@ -10,14 +10,16 @@ LAMPORTS_PER_SOL = 1_000_000_000
 
 
 class Wallet:
-    """Local Solana wallet using direct JSON-RPC.
+    """Wallet wrapper.
 
-    Private keys are used only locally for signing. Only signed transactions
-    are sent to the RPC endpoint.
+    Startup never requires a private key. This is important because the bot's
+    Telegram UI can start before a wallet is connected/configured.
+    Secrets, when used for automated trading, are loaded only from Railway
+    environment variables and transactions are signed locally.
     """
 
     def __init__(self):
-        self.keypair = self._load()
+        self.keypair: Keypair | None = None
         self.rpc_url = settings.rpc_url
 
     def _load(self) -> Keypair:
@@ -44,13 +46,24 @@ class Wallet:
         if settings.generate_burner:
             kp = Keypair()
             print(f"[BURNER] Generated wallet: {kp.pubkey()}")
-            print("[BURNER] This wallet is ephemeral. Do not fund it until its public key is verified.")
             return kp
 
-        raise RuntimeError("Set WALLET_PRIVATE_KEY or WALLET_MNEMONIC, or GENERATE_BURNER=true")
+        raise RuntimeError("Wallet not connected/configured")
+
+    def connect_from_environment(self) -> Pubkey:
+        """Load the configured automated-trading wallet on demand."""
+        if self.keypair is None:
+            self.keypair = self._load()
+        return self.keypair.pubkey()
+
+    @property
+    def connected(self) -> bool:
+        return self.keypair is not None
 
     @property
     def pubkey(self) -> Pubkey:
+        if self.keypair is None:
+            raise RuntimeError("Wallet not connected")
         return self.keypair.pubkey()
 
     def short_address(self) -> str:
@@ -67,13 +80,17 @@ class Wallet:
             raise RuntimeError(str(data["error"]))
         return data.get("result")
 
-    async def balance_sol(self) -> float:
-        result = await self._rpc("getBalance", [str(self.pubkey), {"commitment": "confirmed"}])
+    async def balance_sol_async(self) -> float:
+        address = str(self.pubkey)
+        result = await self._rpc("getBalance", [address, {"commitment": "confirmed"}])
         return result["value"] / LAMPORTS_PER_SOL
 
     def sign(self, raw_tx: bytes) -> bytes:
+        if self.keypair is None:
+            raise RuntimeError("Wallet not connected")
         tx = VersionedTransaction.from_bytes(raw_tx)
-        return bytes(VersionedTransaction(tx.message, [self.keypair]))
+        signed = VersionedTransaction(tx.message, [self.keypair])
+        return bytes(signed)
 
     async def send_raw(self, raw_tx: bytes) -> str:
         encoded = base64.b64encode(raw_tx).decode("ascii")
@@ -84,4 +101,5 @@ class Wallet:
         return str(result)
 
 
+# Lazy wallet: importing bot.py must never crash because no wallet secret is set.
 wallet = Wallet()
