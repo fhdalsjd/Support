@@ -42,6 +42,45 @@ async def _available_trade_sol() -> tuple[float, float]:
     return max(0.0, balance - protected), balance
 
 
+def _entry_snapshot(overview, rug, analysis, allocation_pct: float, trade_amount: float, quote_impact: float) -> dict:
+    """Freeze the exact token intelligence used to approve an automatic entry."""
+    return {
+        "source": "auto_sniper",
+        "allocation_pct": allocation_pct,
+        "trade_amount_sol": trade_amount,
+        "price_impact_pct": quote_impact,
+        "risk_score": getattr(analysis, "risk_score", None),
+        "risk_level": getattr(rug, "risk_level", None),
+        "rug_notes": list(getattr(rug, "notes", []) or []),
+        "price_usd": overview.price_usd,
+        "market_cap_usd": overview.market_cap,
+        "fdv_usd": overview.fdv,
+        "liquidity_usd": overview.liquidity_usd,
+        "volume_5m_usd": overview.volume_5m,
+        "volume_24h_usd": overview.volume_24h,
+        "trades_5m": overview.total_trades_5m,
+        "trades_24h": overview.total_trades_24h,
+        "buy_sell_ratio_5m": overview.buy_sell_ratio_5m,
+        "change_5m_pct": overview.change_5m,
+        "change_1h_pct": overview.change_1h,
+        "pool_age_minutes": overview.age_minutes,
+        "primary_pool_age_minutes": getattr(overview, "primary_pool_age_minutes", None),
+        "oldest_pool_age_minutes": getattr(overview, "oldest_pool_age_minutes", None),
+        "pool_count": overview.pool_count,
+        "dex": overview.dex,
+        "decimals": overview.decimals,
+        "total_supply": overview.total_supply,
+        "mint_authority": getattr(overview, "mint_authority", None),
+        "freeze_authority": getattr(overview, "freeze_authority", None),
+        "top_holder_pct": getattr(overview, "top_holder_pct", None),
+        "data_quality": overview.data_quality,
+        "data_warnings": list(getattr(overview, "data_warnings", []) or []),
+        "market_cap_source": getattr(overview, "market_cap_source", None),
+        "data_source": getattr(overview, "data_source", None),
+        "fetched_at": getattr(overview, "fetched_at", None),
+    }
+
+
 async def tick(context) -> None:
     global _last_buy_at
 
@@ -51,8 +90,6 @@ async def tick(context) -> None:
 
     allocation_pct = st.get("auto_sniper_allocation_pct")
     if allocation_pct is None:
-        # Auto-sniper must never trade until the admin explicitly selects
-        # the percentage of spendable SOL to allocate per new position.
         return
     try:
         allocation_pct = float(allocation_pct)
@@ -69,16 +106,11 @@ async def tick(context) -> None:
         return
 
     available_sol, balance = await _available_trade_sol()
-    trade_amount = min(
-        available_sol * allocation_pct / 100.0,
-        settings.max_buy_sol,
-    )
+    trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol)
     if trade_amount <= 0:
         return
     if await _auto_exposure_sol(positions) + trade_amount > settings.auto_sniper_max_exposure_sol:
         return
-
-    # Keep enough SOL untouched for future TP/SL/Smart-SL sells and fees.
     if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
         return
 
@@ -142,34 +174,31 @@ async def tick(context) -> None:
             if mint in current_positions or len(current_positions) >= settings.auto_sniper_max_positions:
                 continue
 
-            # Recalculate allocation immediately before the quote/buy so a
-            # balance change cannot cause the bot to consume the protected reserve.
+            # Recalculate immediately before quoting.
             available_sol, balance = await _available_trade_sol()
             trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol)
             remaining_exposure = settings.auto_sniper_max_exposure_sol - await _auto_exposure_sol(current_positions)
             trade_amount = min(trade_amount, remaining_exposure)
-            if trade_amount <= 0:
-                continue
-            if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
-                continue
-
-            quote = await get_quote(
-                SOL_MINT,
-                mint,
-                int(trade_amount * 1_000_000_000),
-                settings.auto_sniper_slippage_bps,
-            )
-            if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
-                continue
-
-            # Final balance check immediately before spending.
-            available_sol, balance = await _available_trade_sol()
-            trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol, remaining_exposure)
             if trade_amount <= 0 or balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
                 continue
 
+            # Quote the exact final amount that will be submitted. This keeps
+            # the Jupiter price-impact gate consistent with the actual spend.
+            quote = await get_quote(SOL_MINT, mint, int(trade_amount * 1_000_000_000), settings.auto_sniper_slippage_bps)
+            if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
+                continue
+
+            # One last balance check; if balance changed, skip this candidate
+            # rather than reusing a quote for a different amount.
+            available_sol_now, balance_now = await _available_trade_sol()
+            final_amount = min(available_sol_now * allocation_pct / 100.0, settings.max_buy_sol, remaining_exposure)
+            if final_amount <= 0 or balance_now - final_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
+                continue
+            if abs(final_amount - trade_amount) > 1e-12:
+                continue
+
             before_balance = await wallet.get_token_balance(mint)
-            result = await buy_token(mint, trade_amount, settings.auto_sniper_slippage_bps)
+            result = await buy_token(mint, final_amount, settings.auto_sniper_slippage_bps)
             if not result.success:
                 log.warning("Auto-sniper buy failed for %s: %s", mint, result.error)
                 continue
@@ -194,23 +223,27 @@ async def tick(context) -> None:
                 decimals=decimals,
                 take_profit_pct=st["default_tp_pct"],
                 stop_loss_pct=st["default_sl_pct"],
-                entry_sol=trade_amount,
+                entry_sol=final_amount,
+                opened_at=time.time(),
+                buy_signature=result.signature,
+                entry_snapshot=_entry_snapshot(overview, rug, analysis, allocation_pct, final_amount, quote.price_impact_pct),
             )
             await store.upsert_position(pos)
             _last_buy_at = time.time()
             await context.bot.send_message(
                 next(iter(settings.admin_ids)),
-                f"🤖 *AUTO-SNIPER BUY*\n\n"
-                f"Token: `${symbol}`\nMint: `{mint}`\n"
-                f"Risk: `{analysis.risk_score}/100`\n"
-                f"Data: `{overview.data_quality}` • Pools: `{overview.pool_count}`\n"
-                f"Liquidity: `${liquidity:,.0f}` ({overview.liquidity_mcap_pct:.1f}% of MC)\n"
-                f"5m: `{change_5m:+.1f}%` • Buy/Sell: `{ratio:.2f}` • Trades: `{trades_5m}`\n"
+                f"🤖 *AUTO-SNIPER BUY — POSITION OPEN*\n\n"
+                f"Token: `${symbol}`\nName: `{overview.name}`\nMint / CA: `{mint}`\n\n"
+                f"Entry: `${overview.price_usd:.10f}`\nTokens: `{token_delta:.8g}`\nSpend: `{final_amount:.9f} SOL`\n"
+                f"Allocation: `{allocation_pct:g}%` of spendable SOL\nTP: `+{st['default_tp_pct']}%` • Hard SL: `-{st['default_sl_pct']}%`\n\n"
+                f"Risk: `{analysis.risk_score}/100` • RugCheck: `{rug.risk_level}`\n"
+                f"Liquidity: `${liquidity:,.0f}` • MC: `${market_cap:,.0f}` • FDV: `${overview.fdv:,.0f}`\n"
+                f"5m volume: `${volume_5m:,.0f}` • 5m trades: `{trades_5m}` • Buy/Sell: `{ratio:.2f}`\n"
+                f"Momentum: 5m `{change_5m:+.1f}%` • 1h `{overview.change_1h:+.1f}%`\n"
+                f"Pools: `{overview.pool_count}` • DEX: `{overview.dex}` • Data: `{overview.data_quality}`\n"
                 f"Jupiter impact: `{quote.price_impact_pct:.2f}%`\n"
-                f"Allocation: `{allocation_pct:g}%` of spendable SOL\n"
-                f"Amount: `{trade_amount:.9f} SOL`\n"
                 f"Protected reserve: `{settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:.3f} SOL`\n"
-                f"Tx: `{result.signature}`",
+                f"Buy Tx: `{result.signature}`",
                 parse_mode="Markdown",
             )
             return
