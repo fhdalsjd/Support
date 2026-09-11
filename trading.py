@@ -1,25 +1,10 @@
 """
 trading.py — Quote + swap execution.
 
-Uses Jupiter's aggregator API (quote-api.jup.ag) which routes across every
-major Solana DEX/AMM — including Raydium pools and Pump.fun bonding curves
-once a token has graduated to an AMM, and increasingly Pump.fun directly.
-This is the practical, battle-tested approach real trading bots use rather
-than hand-building raw AMM instructions, which is brittle and easy to get
-wrong in ways that lose funds.
-
-Priority landing is handled two ways:
-  1. A compute-unit price (priority fee) is requested from Jupiter directly.
-  2. Optionally, a Jito tip transfer instruction can be attached so the swap
-     is bundle-eligible via Jito's block engine, reducing sandwich risk.
-
-NOTE ON JITO BUNDLES: full bundle submission (grouping multiple transactions
-atomically via Jito's sendBundle RPC) is stubbed with a clear extension
-point below (`submit_jito_bundle`). Wire in `jito-searcher-client` or a raw
-HTTP call to your block engine's `/api/v1/bundles` endpoint if you need true
-atomic multi-tx bundles; single-tx swaps with a tip account transfer (as
-implemented here) already get you most of the anti-sandwich benefit.
+Uses Jupiter's current Lite Swap API. The old quote-api.jup.ag/v6 host is
+retired/unreachable; lite-api.jup.ag/swap/v1 is the no-key endpoint.
 """
+import asyncio
 import base64
 import httpx
 from dataclasses import dataclass
@@ -27,18 +12,23 @@ from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.message import MessageV0
-from solders.instruction import Instruction
 
 from config import settings
 from wallet import wallet, LAMPORTS_PER_SOL
 
 SOL_MINT = "So11111111111111111111111111111111111111112"
-
-# Jito tip accounts (any one is valid — pick round robin in production)
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
 ]
+
+
+def _jupiter_base() -> str:
+    base = settings.jupiter_quote_api.rstrip("/")
+    # Protect Railway deployments that still have the old variable configured.
+    if "quote-api.jup.ag" in base or base.endswith("/v6"):
+        return "https://lite-api.jup.ag/swap/v1"
+    return base
 
 
 @dataclass
@@ -57,46 +47,72 @@ class SwapResult:
     error: str | None = None
 
 
+async def _request(method: str, url: str, **kwargs):
+    """Retry transient DNS/network/5xx failures without ever retrying a swap POST blindly."""
+    attempts = 3 if method.upper() == "GET" else 2
+    last = None
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=15) as http:
+                r = await http.request(method, url, **kwargs)
+                if r.status_code >= 500 and attempt + 1 < attempts:
+                    await asyncio.sleep(0.7 * (attempt + 1))
+                    continue
+                return r
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, httpx.RemoteProtocolError) as exc:
+            last = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.7 * (attempt + 1))
+                continue
+            raise
+    if last:
+        raise last
+    raise RuntimeError("HTTP request failed")
+
+
 async def get_quote(input_mint: str, output_mint: str, amount_lamports: int, slippage_bps: int) -> QuoteResult:
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(
-            f"{settings.jupiter_quote_api}/quote",
-            params={
-                "inputMint": input_mint,
-                "outputMint": output_mint,
-                "amount": amount_lamports,
-                "slippageBps": slippage_bps,
-                "onlyDirectRoutes": "false",
-            },
-        )
-        r.raise_for_status()
-        data = r.json()
-        route_labels = [step["swapInfo"]["label"] for step in data.get("routePlan", [])]
-        return QuoteResult(
-            raw=data,
-            in_amount=int(data["inAmount"]),
-            out_amount=int(data["outAmount"]),
-            price_impact_pct=float(data.get("priceImpactPct", 0)) * 100,
-            route_summary=" -> ".join(route_labels) or "direct",
-        )
+    if amount_lamports <= 0:
+        raise ValueError("Swap amount must be positive")
+    params = {
+        "inputMint": input_mint,
+        "outputMint": output_mint,
+        "amount": amount_lamports,
+        "slippageBps": slippage_bps,
+        "restrictIntermediateTokens": "true",
+        "instructionVersion": "V2",
+    }
+    r = await _request("GET", f"{_jupiter_base()}/quote", params=params)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Jupiter HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+    route_labels = [step.get("swapInfo", {}).get("label", "?") for step in data.get("routePlan", [])]
+    return QuoteResult(
+        raw=data,
+        in_amount=int(data["inAmount"]),
+        out_amount=int(data["outAmount"]),
+        price_impact_pct=float(data.get("priceImpactPct", 0)) * 100,
+        route_summary=" -> ".join(route_labels) or "direct",
+    )
 
 
 async def build_swap_transaction(quote: QuoteResult, priority_fee_microlamports: int) -> VersionedTransaction:
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.post(
-            f"{settings.jupiter_quote_api}/swap",
-            json={
-                "quoteResponse": quote.raw,
-                "userPublicKey": str(wallet.pubkey),
-                "wrapAndUnwrapSol": True,
-                "prioritizationFeeLamports": priority_fee_microlamports,
-                "dynamicComputeUnitLimit": True,
-            },
-        )
-        r.raise_for_status()
-        swap_tx_b64 = r.json()["swapTransaction"]
-        raw = base64.b64decode(swap_tx_b64)
-        return VersionedTransaction.from_bytes(raw)
+    payload = {
+        "quoteResponse": quote.raw,
+        "userPublicKey": str(wallet.pubkey),
+        "wrapAndUnwrapSol": True,
+        "dynamicComputeUnitLimit": True,
+        "prioritizationFeeLamports": priority_fee_microlamports,
+    }
+    r = await _request("POST", f"{_jupiter_base()}/swap", json=payload)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Jupiter swap build HTTP {r.status_code}: {r.text[:300]}")
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(str(data["error"]))
+    raw = base64.b64decode(data["swapTransaction"])
+    return VersionedTransaction.from_bytes(raw)
 
 
 async def execute_swap(
@@ -107,17 +123,16 @@ async def execute_swap(
     priority_fee_microlamports: int | None = None,
     add_jito_tip: bool = True,
 ) -> SwapResult:
-    """
-    Full pipeline: quote -> build tx -> (optional jito tip) -> sign -> send -> confirm.
-    Used for both BUY (SOL -> token) and SELL (token -> SOL) by swapping mint order.
-    """
     slippage_bps = slippage_bps or settings.default_slippage_bps
     priority_fee = priority_fee_microlamports or settings.default_priority_fee_microlamports
 
+    if input_mint == output_mint:
+        return SwapResult(success=False, error="Input and output token are identical")
+
     try:
         quote = await get_quote(input_mint, output_mint, amount_lamports, slippage_bps)
-    except httpx.HTTPStatusError as e:
-        return SwapResult(success=False, error=f"Quote failed (no route / low liquidity): {e}")
+    except httpx.RequestError as e:
+        return SwapResult(success=False, error=f"Jupiter network unavailable after retries: {type(e).__name__}")
     except Exception as e:
         return SwapResult(success=False, error=f"Quote error: {e}")
 
@@ -129,13 +144,7 @@ async def execute_swap(
     except Exception as e:
         return SwapResult(success=False, error=f"Failed to build swap tx: {e}")
 
-    # NOTE: Jupiter's returned transaction already includes compute budget +
-    # swap instructions signed for our pubkey as fee payer. We sign it as-is.
-    # (A separate standalone Jito tip transfer can be sent alongside — see
-    # submit_jito_bundle below — rather than injected into this tx, since
-    # Jupiter's tx is pre-serialized.)
     signed_tx = wallet.sign_transaction(tx)
-
     try:
         resp = await wallet.client.send_raw_transaction(bytes(signed_tx))
         sig = str(resp.value)
@@ -151,16 +160,12 @@ async def execute_swap(
         try:
             await send_jito_tip(settings.jito_tip_lamports)
         except Exception:
-            pass  # tip failure should never block a successful swap
+            pass
 
     return SwapResult(success=True, signature=sig)
 
 
 async def send_jito_tip(lamports: int):
-    """Sends a small standalone tip to a Jito tip account to incentivize
-    fast inclusion of nearby transactions from this wallet. For true atomic
-    bundling, replace this with a real sendBundle call to
-    settings.jito_block_engine_url + '/api/v1/bundles'."""
     import random
     tip_account = Pubkey.from_string(random.choice(JITO_TIP_ACCOUNTS))
     ix = transfer(TransferParams(from_pubkey=wallet.pubkey, to_pubkey=tip_account, lamports=lamports))
