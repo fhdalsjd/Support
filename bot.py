@@ -13,12 +13,24 @@ from state import store, Position
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("membot")
-MINT_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
+
+# Solana public keys are base58 strings, normally 43-44 characters. The
+# extractor deliberately allows surrounding punctuation/whitespace so pasted
+# addresses from Telegram, DEX pages, or URLs are still detected.
+MINT_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
+ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
 _pending_ca: dict[int, str] = {}
 _awaiting_custom_amount: dict[int, str] = {}
 _awaiting_custom_sell_pct: dict[int, str] = {}
 _awaiting_wallet_mnemonic: set[int] = set()
 _live_position_messages: dict[int, int] = {}
+
+
+def _extract_mint(text: str) -> str | None:
+    """Extract a Solana mint from arbitrary pasted Telegram text."""
+    cleaned = ZERO_WIDTH_RE.sub("", text or "").strip()
+    match = MINT_RE.search(cleaned)
+    return match.group(0) if match else None
 
 
 def admin_only(handler):
@@ -189,10 +201,10 @@ async def refresh_token_cb(update: Update, context: ContextTypes.DEFAULT_TYPE, m
 @admin_only
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    text = ZERO_WIDTH_RE.sub("", (update.message.text or "")).strip()
     if chat_id in _awaiting_wallet_mnemonic:
         await handle_wallet_mnemonic(update, context)
         return
-    text = update.message.text.strip()
     if chat_id in _awaiting_custom_sell_pct:
         mint = _awaiting_custom_sell_pct.pop(chat_id)
         try:
@@ -215,9 +227,18 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await do_buy(update, context, mint, amount)
         return
-    match = MINT_RE.search(text)
-    if match:
-        await show_token_overview(update, context, match.group(0))
+
+    mint = _extract_mint(text)
+    if mint:
+        log.info("Detected Solana mint in Telegram message: %s...%s", mint[:6], mint[-4:])
+        await show_token_overview(update, context, mint)
+        return
+
+    # Never fail silently. This also makes clipboard/paste problems obvious.
+    await update.message.reply_text(
+        "⚠️ I couldn't detect a Solana token address in that message.\n\n"
+        "Paste the full mint address (usually 43–44 base58 characters)."
+    )
 
 
 async def do_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str, sol_amount: float):
