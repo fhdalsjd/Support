@@ -1,7 +1,9 @@
 .env
-data/
-sessions/
+.env.*
+!.env.example
 __pycache__/
 *.pyc
-.pytest_cache/
-*.db
+data/*.sqlite3
+*.session
+*.log
+.venv/
