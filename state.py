@@ -16,8 +16,9 @@ class Position:
     entry_price_usd: float
     amount_tokens: float
     decimals: int
+    # Fixed TP is intentionally disabled. Winners are managed by smart SL.
     take_profit_pct: float | None = None
-    stop_loss_pct: float | None = None
+    stop_loss_pct: float | None = 30.0
     trailing_sl_pct: float | None = None
     trailing_high_price: float | None = None
     peak_profit_pct: float = 0.0
@@ -36,7 +37,8 @@ DEFAULT_STATE = {
     "priority_fee_microlamports": settings.default_priority_fee_microlamports,
     "auto_sniper_enabled": False,
     "auto_sniper_allocation_pct": None,
-    "default_tp_pct": 100.0,
+    # No fixed TP. Smart SL manages profitable positions.
+    "default_tp_pct": None,
     "default_sl_pct": 30.0,
 }
 
@@ -57,6 +59,24 @@ def _load() -> dict:
         data["positions"] = {}
     if not isinstance(data.get("history"), list):
         data["history"] = []
+
+    # Migrate old positions to the current exit policy. This means a position
+    # opened under an older build cannot later be closed by a legacy fixed TP
+    # or trailing-stop rule.
+    for raw in data["positions"].values():
+        if isinstance(raw, dict):
+            raw["take_profit_pct"] = None
+            raw["trailing_sl_pct"] = None
+            raw["stop_loss_pct"] = 30.0
+            raw.setdefault("peak_profit_pct", 0.0)
+            raw.setdefault("smart_stop_profit_pct", None)
+            raw.setdefault("entry_sol", 0.0)
+            raw.setdefault("opened_at", 0.0)
+            raw.setdefault("buy_signature", None)
+            raw.setdefault("entry_snapshot", {})
+            raw.setdefault("close_events", [])
+    data["default_tp_pct"] = None
+    data["default_sl_pct"] = 30.0
     return data
 
 
