@@ -35,7 +35,6 @@ _pending_ca: dict[int, str] = {}
 _awaiting_custom_amount: dict[int, str] = {}
 _awaiting_custom_sell_pct: dict[int, str] = {}
 _awaiting_wallet_mnemonic: set[int] = set()
-_live_position_messages: dict[int, int] = {}
 
 
 def _extract_mint(text: str) -> str | None:
@@ -442,21 +441,12 @@ async def _positions_text_and_kb():
 
 
 async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Manual refresh only (tap 🔄) -- no background auto-edit job. Repeatedly
+    # editing the same message on a timer risks Telegram rate-limiting /
+    # temporarily restricting the bot, so the panel updates only on request.
     text, kb = await _positions_text_and_kb()
     query = update.callback_query
-    _live_position_messages[query.message.chat_id] = query.message.message_id
     await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
-
-
-async def live_pnl_daemon(context: ContextTypes.DEFAULT_TYPE):
-    if not _live_position_messages or not wallet.configured:
-        return
-    text, kb = await _positions_text_and_kb()
-    for chat_id, message_id in list(_live_position_messages.items()):
-        try:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
-        except Exception:
-            pass
 
 
 async def do_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str, fraction: float):
@@ -640,8 +630,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings(update, context)
 
 
-async def combined_daemon(context: ContextTypes.DEFAULT_TYPE):
+async def smart_sl_daemon(context: ContextTypes.DEFAULT_TYPE):
+    # Runs on its own fast interval (SMART_SL_POLL_SECONDS, default 1s) so an
+    # open position's exits (hard SL, velocity panic, moonbag, ratchet) are
+    # checked far more often than the sniper scans for new candidates.
+    # smart_sl.tick() has its own internal lock, so a slow tick (e.g. a slow
+    # API response) safely skips overlapping runs instead of stacking up.
     await smart_sl.tick(context)
+
+
+async def sniper_daemon(context: ContextTypes.DEFAULT_TYPE):
     await sniper.tick(context)
 
 
@@ -655,9 +653,11 @@ def main():
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Single source of truth for background tasks: Smart SL + Sniper
-    app.job_queue.run_repeating(combined_daemon, interval=settings.auto_sniper_poll_seconds, first=10)
-    app.job_queue.run_repeating(live_pnl_daemon, interval=10, first=15)
+    # Smart SL runs fast (per-second, by default) so open positions get
+    # checked tightly. The sniper only needs to scan for new candidates on
+    # its own slower interval, so it stays on a separate job.
+    app.job_queue.run_repeating(smart_sl_daemon, interval=settings.smart_sl_poll_seconds, first=5)
+    app.job_queue.run_repeating(sniper_daemon, interval=settings.auto_sniper_poll_seconds, first=10)
     log.info("Bot starting — whitelisted admins: %s", settings.admin_ids)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

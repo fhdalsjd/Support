@@ -45,6 +45,12 @@ class Settings:
     auto_fee_reserve_sol: float = _float("AUTO_FEE_RESERVE_SOL", 0.005)
     auto_safety_buffer_sol: float = _float("AUTO_SAFETY_BUFFER_SOL", 0.002)
 
+    # How often open positions are re-checked for exits (Smart-SL, hard SL,
+    # velocity panic, moonbag, etc). Kept separate from AUTO_SNIPER_POLL_SECONDS
+    # (candidate scanning) because a fast-moving position needs much tighter
+    # monitoring than scanning for new tokens to buy does.
+    smart_sl_poll_seconds: float = _float("SMART_SL_POLL_SECONDS", 3.0)
+
     # Auto-sniper is opt-in in state.json. These limits are deliberately
     # independent from the manual MAX_BUY_SOL cap.
     auto_sniper_buy_sol: float = _float("AUTO_SNIPER_BUY_SOL", 0.01)
@@ -90,6 +96,8 @@ class Settings:
             errs.append("ADMIN_IDS is empty — bot would be unusable/unsafe with no whitelist")
         if self.wallet_mnemonic and self.wallet_private_key_b58:
             errs.append("Provide only ONE of WALLET_MNEMONIC / WALLET_PRIVATE_KEY_B58, not both")
+        if self.smart_sl_poll_seconds <= 0:
+            errs.append("SMART_SL_POLL_SECONDS must be > 0")
         if self.auto_sniper_buy_sol <= 0 or self.auto_sniper_buy_sol > self.max_buy_sol:
             errs.append("AUTO_SNIPER_BUY_SOL must be > 0 and <= MAX_BUY_SOL")
         if self.auto_fee_reserve_sol <= 0:
