@@ -13,6 +13,7 @@ from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Confirmed
+from solana.rpc.types import TokenAccountOpts
 
 from config import settings
 
@@ -141,7 +142,12 @@ class Wallet:
 
     async def get_token_balance(self, mint: str) -> float:
         self._require_configured()
-        opts = {"mint": mint}
+        # solana-py's get_token_accounts_by_owner_json_parsed requires a real
+        # TokenAccountOpts (it reads .mint / .program_id / .data_slice off
+        # whatever is passed in) -- a plain {"mint": mint} dict has none of
+        # those attributes and raises AttributeError on every call, which
+        # made every buy/sell/position-check fail with a generic error.
+        opts = TokenAccountOpts(mint=Pubkey.from_string(mint))
         resp = await self.client.get_token_accounts_by_owner_json_parsed(self.pubkey, opts)
         total = 0.0
         for acct in resp.value:
