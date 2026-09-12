@@ -91,7 +91,7 @@ def _page() -> bytes:
     pos_rows = "".join(
         f"<tr><td><b>${html.escape(str(p.get('symbol','?')))}</b></td><td><code>{html.escape(str(p.get('mint','')))}</code></td>"
         f"<td>${float(p.get('entry_price_usd',0)):.8f}</td><td>{float(p.get('amount_tokens',0)):.6f}</td>"
-        f"<td>+{p.get('take_profit_pct','—')}%</td><td>-{p.get('stop_loss_pct','—')}%</td>"
+        f"<td>Disabled</td><td>-{float(p.get('stop_loss_pct',30) or 30):g}%</td>"
         f"<td>{_smart_sl_text(p.get('smart_stop_profit_pct'))}</td><td>+{float(p.get('peak_profit_pct',0)):.1f}%</td></tr>"
         for p in s["positions"]
     ) or '<tr><td colspan="8" class="muted">No open positions</td></tr>'
@@ -109,7 +109,7 @@ body{{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-syste
 </style></head><body><main>
 <h1>Solana Trading Bot</h1><div class="muted">Live Railway service dashboard · refreshes every 5 seconds</div>
 <div class="grid"><div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div><div class="card"><div class="muted">Bot</div><div class="value">{"RUNNING" if s["bot_loaded"] else "OFFLINE"}</div></div><div class="card"><div class="muted">Wallet</div><div class="value">{wallet_text}</div><div class="small">{html.escape(wallet_addr)}</div></div><div class="card"><div class="muted">Auto-Sniper</div><div class="value">{sniper}</div><div class="small">Allocation: {allocation}</div></div><div class="card"><div class="muted">Open positions</div><div class="value">{len(s["positions"])}</div></div><div class="card"><div class="muted">Closed history</div><div class="value">{len(s["history"])}</div></div></div>
-<h2>🟢 Open positions</h2><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody>{pos_rows}</tbody></table>
+<h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody>{pos_rows}</tbody></table>
 <h2>📚 Closed trade history</h2><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody>{hist_rows}</tbody></table>
 <div class="note"><b>Trade journal</b><br>Each completed trade keeps its entry snapshot, contract address, market/security data, entry and exit prices, close reason, peak/Smart-SL state, and buy/sell transaction signatures. The history is capped at 500 records and stored atomically in the bot state file.</div>
 <p class="small">No private key or recovery phrase is displayed. Last refresh: <span id="t"></span></p><script>document.getElementById('t').textContent=new Date().toLocaleTimeString();setTimeout(()=>location.reload(),5000);</script>
