@@ -1,14 +1,19 @@
-"""Smart stop-loss manager for open Solana positions.
+"""Deterministic profit-protection engine for every open position.
 
-Policy:
-- Keep original hard SL while unproven.
-- At +5% profit, move to break-even.
-- At +10% peak, lock 50% of peak profit.
-- Ratchet only upward after the configured step.
+Exit policy:
+- No fixed take-profit.
+- Hard downside protection starts at -30% by default.
+- At +5% peak profit, stop moves to break-even.
+- At +10% peak profit, stop locks 50% of peak profit.
+- Thereafter the stop ratchets upward to 50% of the best profit reached,
+  only after the configured ratchet step.
+- The stop never moves backward.
+- Every completed smart-SL exit is written to permanent trade history.
 """
 from __future__ import annotations
 
 import logging
+import time
 from telegram.ext import ContextTypes
 
 from config import settings
@@ -20,7 +25,7 @@ from wallet import wallet
 log = logging.getLogger("smart-sl")
 
 
-async def _close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, pos: Position, reason: str):
+async def _close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, pos: Position, reason: str, exit_price: float | None = None):
     try:
         wallet_balance = await wallet.get_token_balance(mint)
         recorded_balance = max(0.0, float(pos.amount_tokens or 0.0))
@@ -33,18 +38,64 @@ async def _close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, p
         raw_units = int(balance * (10 ** pos.decimals))
         if raw_units <= 0:
             return False
-        result = await sell_token(mint, raw_units, pos.decimals)
-        if result.success:
-            await store.remove_position(mint)
-            await context.bot.send_message(
-                admin_id,
-                f"🧠 Smart SL closed *${pos.symbol}* — {reason}\nTx: `{result.signature}`",
-                parse_mode="Markdown",
-            )
-            return True
 
-        await context.bot.send_message(admin_id, f"⚠️ Smart SL sell FAILED for ${pos.symbol}: {result.error}")
-        return False
+        result = await sell_token(mint, raw_units, pos.decimals)
+        if not result.success:
+            await context.bot.send_message(admin_id, f"⚠️ Smart SL sell FAILED for ${pos.symbol}: {result.error}")
+            return False
+
+        if exit_price is None:
+            exit_price = pos.entry_price_usd
+            try:
+                overview = await get_token_overview(mint)
+                if overview.found and overview.price_usd > 0:
+                    exit_price = overview.price_usd
+            except Exception:
+                pass
+
+        entry = float(pos.entry_price_usd or 0.0)
+        pnl_pct = ((exit_price - entry) / entry * 100.0) if entry > 0 and exit_price else None
+        event = {
+            "closed_at": time.time(),
+            "tokens": balance,
+            "exit_price_usd": exit_price,
+            "sell_signature": result.signature,
+            "reason": reason,
+            "pnl_pct": pnl_pct,
+        }
+        pos.close_events = list(pos.close_events or []) + [event]
+        record = {
+            "closed_at": event["closed_at"],
+            "opened_at": pos.opened_at or None,
+            "mint": mint,
+            "symbol": pos.symbol,
+            "decimals": pos.decimals,
+            "entry_price_usd": entry,
+            "exit_price_usd": exit_price,
+            "entry_sol": float(pos.entry_sol or 0.0),
+            "pnl_pct": pnl_pct,
+            "pnl_sol_estimate": (float(pos.entry_sol or 0.0) * pnl_pct / 100.0) if pnl_pct is not None else None,
+            "amount_tokens": pos.amount_tokens,
+            "exit_tokens": balance,
+            "take_profit_pct": None,
+            "stop_loss_pct": pos.stop_loss_pct,
+            "peak_profit_pct": pos.peak_profit_pct,
+            "smart_stop_profit_pct": pos.smart_stop_profit_pct,
+            "close_reason": reason,
+            "buy_signature": pos.buy_signature,
+            "sell_signature": result.signature,
+            "entry_snapshot": dict(pos.entry_snapshot or {}),
+            "close_events": list(pos.close_events),
+        }
+        await store.append_history(record)
+        await store.remove_position(mint)
+        pnl_text = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "unavailable"
+        await context.bot.send_message(
+            admin_id,
+            f"🧠 Smart SL closed *${pos.symbol}* — {reason}\nPnL: `{pnl_text}`\nTx: `{result.signature}`\n📚 Saved to History",
+            parse_mode="Markdown",
+        )
+        return True
     except Exception as exc:
         log.warning("Smart SL close failed: %s", type(exc).__name__)
         return False
@@ -72,6 +123,21 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
                 pos.peak_profit_pct = peak
                 changed = True
 
+            # Fixed TP is intentionally ignored. Winners stay open until the
+            # smart stop or hard protection closes them.
+            pos.take_profit_pct = None
+            pos.trailing_sl_pct = None
+
+            # Hard downside protection. The default is -30%, but the recorded
+            # position value is respected if an explicit positive SL exists.
+            hard_sl = float(pos.stop_loss_pct if pos.stop_loss_pct is not None else 30.0)
+            if hard_sl <= 0:
+                hard_sl = 30.0
+            if pnl_pct <= -hard_sl:
+                await store.upsert_position(pos)
+                await _close(context, admin_id, mint, pos, f"Hard SL hit ({pnl_pct:.1f}%)", overview.price_usd)
+                continue
+
             current_stop = pos.smart_stop_profit_pct
             if peak >= settings.smart_sl_activation_pct and (current_stop is None or current_stop < 0):
                 pos.smart_stop_profit_pct = 0.0
@@ -88,13 +154,16 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             if changed:
                 await store.upsert_position(pos)
 
+            # A smart stop is a profit floor, not a fixed TP. A strong winner
+            # can therefore continue running while its protected floor ratchets.
             if pos.smart_stop_profit_pct is not None and pnl_pct <= pos.smart_stop_profit_pct:
                 await _close(
                     context,
                     admin_id,
                     mint,
                     pos,
-                    f"profit lock {pos.smart_stop_profit_pct:+.1f}% hit (peak +{pos.peak_profit_pct:.1f}%, now {pnl_pct:+.1f}%)",
+                    f"Profit lock {pos.smart_stop_profit_pct:+.1f}% hit (peak +{pos.peak_profit_pct:.1f}%, now {pnl_pct:+.1f}%)",
+                    overview.price_usd,
                 )
         except Exception as exc:
             log.warning("Smart SL check failed: %s", type(exc).__name__)
