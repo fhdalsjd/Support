@@ -1,0 +1,571 @@
+"""Telegram trading UI with live token views, PnL refresh, and safe wallet flows."""
+import re
+import logging
+import functools
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
+
+from config import settings
+from wallet import wallet
+from trading import buy_token, sell_token
+import security  # imported as a module (not `from security import ...`) so that
+# sitecustomize.py's live-pricing patch (security.get_token_overview = live_overview)
+# is actually picked up here. A `from X import name` binding freezes a reference to
+# whatever function object existed at import time -- a later `security.get_token_overview
+# = patched_fn` reassignment would never be seen through that frozen name, silently
+# leaving every call in this file on the old, unpatched function.
+from state import store, Position
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("membot")
+
+# Solana public keys are base58 strings, normally 43-44 characters. The
+# extractor deliberately allows surrounding punctuation/whitespace so pasted
+# addresses from Telegram, DEX pages, or URLs are still detected.
+MINT_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
+ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\ufeff]")
+_pending_ca: dict[int, str] = {}
+_awaiting_custom_amount: dict[int, str] = {}
+_awaiting_custom_sell_pct: dict[int, str] = {}
+_awaiting_wallet_mnemonic: set[int] = set()
+_live_position_messages: dict[int, int] = {}
+
+
+def _extract_mint(text: str) -> str | None:
+    """Extract a Solana mint from arbitrary pasted Telegram text."""
+    cleaned = ZERO_WIDTH_RE.sub("", text or "").strip()
+    match = MINT_RE.search(cleaned)
+    return match.group(0) if match else None
+
+
+def admin_only(handler):
+    @functools.wraps(handler)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        user = update.effective_user
+        if not user or user.id not in settings.admin_ids:
+            log.warning("Rejected message from non-admin user_id=%s", user.id if user else None)
+            return
+        return await handler(update, context, *args, **kwargs)
+    return wrapper
+
+
+@admin_only
+async def connect_wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _awaiting_wallet_mnemonic.add(update.effective_chat.id)
+    await update.message.reply_text(
+        "🔐 Wallet connection\n\nSend your Solana recovery phrase in your next message. "
+        "I will validate it, derive the wallet address, check the wallet on-chain, and delete the phrase message when possible.\n\n"
+        "⚠️ The phrase is kept in memory only and is never written to bot state or logs. Use a dedicated trading wallet.\n\n"
+        "Send the phrase now, or /cancel_wallet to stop."
+    )
+
+
+@admin_only
+async def cancel_wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _awaiting_wallet_mnemonic.discard(update.effective_chat.id)
+    await update.message.reply_text("Wallet connection cancelled.")
+
+
+async def _delete_secret_message(message):
+    try:
+        await message.delete()
+        return True
+    except Exception as exc:
+        log.warning("Could not delete wallet credential message: %s", type(exc).__name__)
+        return False
+
+
+@admin_only
+async def handle_wallet_mnemonic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    _awaiting_wallet_mnemonic.discard(chat_id)
+    phrase = update.message.text.strip()
+    deleted = await _delete_secret_message(update.message)
+    try:
+        address = wallet.connect_mnemonic(phrase)
+        balance = await wallet.get_sol_balance()
+    except Exception as exc:
+        log.warning("Wallet connection rejected: %s", type(exc).__name__)
+        await context.bot.send_message(chat_id, "❌ Wallet verification failed. The recovery phrase is invalid or unsupported. Nothing was connected. Please use /connect_wallet to try again.")
+        return
+    delete_note = "🗑 Recovery phrase message deleted." if deleted else "⚠️ Telegram did not allow deletion; delete that message manually now."
+    await context.bot.send_message(
+        chat_id,
+        "✅ *Wallet verified and connected*\n\n"
+        f"Address: `{address}`\nBalance: `{balance:.6f} SOL`\n\n{delete_note}\n"
+        "The recovery phrase is not saved to bot state or logs. It remains only in this running process.",
+        parse_mode="Markdown",
+    )
+
+
+@admin_only
+async def disconnect_wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    wallet.disconnect()
+    await update.message.reply_text("🔌 Wallet disconnected from this bot process. The recovery phrase was not persisted.")
+
+
+async def build_dashboard_text_and_kb():
+    st = await store.get_settings()
+    sniper_state = "🟢 ON" if st["auto_sniper_enabled"] else "🔴 OFF"
+    if wallet.configured:
+        try:
+            bal = await wallet.get_sol_balance()
+            usd_price = await wallet.get_sol_usd_price()
+            wallet_line = f"💰 Balance: `{bal:.6f} SOL` (${bal * usd_price:,.2f})\n🔑 Wallet: `{wallet.short_address()}`"
+        except Exception:
+            wallet_line = f"🔑 Wallet: `{wallet.short_address()}` (balance unavailable)"
+    else:
+        wallet_line = "🔌 Wallet: `Not connected`"
+    text = (
+        "*Solana Trading Bot • Pro Dashboard*\n\n"
+        f"{wallet_line}\n"
+        f"🎯 Auto-Sniper: {sniper_state}\n"
+        f"⚙️ Slippage: {st['slippage_bps']/100:.1f}%\n"
+        f"📊 Open positions: {len(await store.get_positions())}\n\n"
+        "Paste any Solana token mint address to open its live market view."
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Live PnL / Positions", callback_data="positions")],
+        [InlineKeyboardButton("🔐 Connect Wallet", callback_data="connect_wallet"), InlineKeyboardButton("🔌 Disconnect", callback_data="disconnect_wallet")],
+        [InlineKeyboardButton("⚙️ Settings", callback_data="settings"), InlineKeyboardButton(f"🎯 Sniper: {'ON' if st['auto_sniper_enabled'] else 'OFF'}", callback_data="toggle_sniper")],
+        [InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="refresh_dashboard")],
+    ])
+    return text, kb
+
+
+@admin_only
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = await build_dashboard_text_and_kb()
+    await update.message.reply_markdown(text, reply_markup=kb)
+
+
+async def refresh_dashboard_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = await build_dashboard_text_and_kb()
+    await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def _token_view_data(mint: str):
+    overview = await security.get_token_overview(mint)
+    if not overview.found:
+        return None, None, "❌ No market data found for this mint yet. It may be too new or have no usable liquidity."
+    rug = await security.get_rug_verdict(mint)
+    return overview, rug, None
+
+
+async def _render_token_message(message, context: ContextTypes.DEFAULT_TYPE, mint: str):
+    # Viewing token intelligence is read-only. Wallet is required only for trading.
+    try:
+        overview, rug, error = await _token_view_data(mint)
+        if error:
+            await message.edit_text(error, reply_markup=_back_kb())
+            return
+        risk_emoji = {"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🔴", "UNKNOWN": "⚪"}.get(rug.risk_level, "⚪")
+        positions = await store.get_positions()
+        pos = positions.get(mint)
+        live_line = ""
+        if pos and pos.entry_price_usd:
+            pnl = (overview.price_usd - pos.entry_price_usd) / pos.entry_price_usd * 100
+            value = overview.price_usd * pos.amount_tokens
+            live_line = f"\n📈 *Live PnL:* {pnl:+.2f}%\n💼 Position value: ${value:,.2f}\n"
+        text = (
+            f"*{overview.name}* (`${overview.symbol}`)\n`{mint}`\n\n"
+            f"💵 Price: `${overview.price_usd:.8f}`\n"
+            f"🏦 Market Cap: `${overview.market_cap:,.0f}`\n"
+            f"💧 Liquidity: `${overview.liquidity_usd:,.0f}`\n"
+            f"📈 Momentum: 5m `{overview.change_5m:+.1f}%` • 1h `{overview.change_1h:+.1f}%`\n"
+            f"🏛 DEX: `{overview.dex}`\n"
+            f"{risk_emoji} *RugCheck:* `{rug.risk_level}`\n"
+            + ("\n".join(f"• {n}" for n in rug.notes[:5]) if rug.notes else "• No additional notes")
+            + live_line
+            + ("\n🟢 Wallet ready for trading" if wallet.configured else "\n🔌 Connect wallet to buy/sell")
+        )
+        _pending_ca[message.chat_id] = mint
+        buttons = [
+            [InlineKeyboardButton("0.01 SOL", callback_data=f"buy:{mint}:0.01"), InlineKeyboardButton("0.05 SOL", callback_data=f"buy:{mint}:0.05"), InlineKeyboardButton("0.1 SOL", callback_data=f"buy:{mint}:0.1")],
+            [InlineKeyboardButton("✏️ Custom Amount", callback_data=f"custom:{mint}"), InlineKeyboardButton("🔄 Refresh Token", callback_data=f"tokenrefresh:{mint}")],
+        ]
+        if pos:
+            buttons.append([InlineKeyboardButton("💼 Close Position", callback_data=f"closemenu:{mint}")])
+        buttons.append([InlineKeyboardButton("📊 Live PnL", callback_data="positions"), InlineKeyboardButton("❌ Close", callback_data="cancel")])
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode="Markdown")
+    except Exception as exc:
+        log.exception("Token overview failed: %s", type(exc).__name__)
+        await message.edit_text("⚠️ Token live view failed. Press Refresh Token to retry.", reply_markup=_back_kb())
+
+
+@admin_only
+async def show_token_overview(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str):
+    msg = await update.message.reply_text("🔎 Loading live token market...")
+    await _render_token_message(msg, context, mint)
+
+
+async def refresh_token_cb(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str):
+    await _render_token_message(update.callback_query.message, context, mint)
+
+
+@admin_only
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    text = ZERO_WIDTH_RE.sub("", (update.message.text or "")).strip()
+    if chat_id in _awaiting_wallet_mnemonic:
+        await handle_wallet_mnemonic(update, context)
+        return
+    if chat_id in _awaiting_custom_sell_pct:
+        mint = _awaiting_custom_sell_pct.pop(chat_id)
+        try:
+            pct = float(text.replace("%", "").strip())
+            if not 0 < pct <= 100:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Enter a close percentage from 0.01% to 100%. Example: 37.5")
+            return
+        await do_sell(update, context, mint, pct / 100.0)
+        return
+    if chat_id in _awaiting_custom_amount:
+        mint = _awaiting_custom_amount.pop(chat_id)
+        try:
+            amount = float(text)
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("That's not a valid positive SOL amount. Buy cancelled.")
+            return
+        await do_buy(update, context, mint, amount)
+        return
+
+    mint = _extract_mint(text)
+    if mint:
+        log.info("Detected Solana mint in Telegram message: %s...%s", mint[:6], mint[-4:])
+        try:
+            await show_token_overview(update, context, mint)
+        except Exception as exc:
+            log.exception("Token message handler failed: %s", type(exc).__name__)
+            await update.message.reply_text("⚠️ I received the token address, but the live token lookup failed. Please try again in a few seconds.")
+        return
+
+    # Never fail silently. This also makes clipboard/paste problems obvious.
+    await update.message.reply_text(
+        "⚠️ I couldn't detect a Solana token address in that message.\n\n"
+        "Paste the full mint address (usually 43–44 base58 characters)."
+    )
+
+
+async def do_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str, sol_amount: float):
+    chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+    if not wallet.configured:
+        await context.bot.send_message(chat_id, "🔌 No wallet connected. Use /connect_wallet first.")
+        return
+    if sol_amount > settings.max_buy_sol:
+        await context.bot.send_message(chat_id, f"❌ Maximum buy is {settings.max_buy_sol} SOL.")
+        return
+    notice = await context.bot.send_message(chat_id, f"⏳ Preflighting buy of `{sol_amount:.9f} SOL`...", parse_mode="Markdown")
+    try:
+        overview = await security.get_token_overview(mint)
+        result = await buy_token(mint, sol_amount)
+        if not result.success:
+            await notice.edit_text(result.error or "❌ Buy failed")
+            return
+
+        # Decimals matter a lot: every future sell computes raw on-chain units
+        # as amount_tokens * 10**decimals. A wrong value here either fails
+        # every sell (decimals too high -> we ask to sell more raw units than
+        # we own) or silently leaves most of the position unsold (decimals
+        # too low). Prefer the on-chain value already fetched into `overview`;
+        # only fall back to a dedicated lookup (or the historically-hardcoded
+        # 9) if that snapshot didn't have it -- which happens for tokens too
+        # new for the RPC/DexScreener data to have caught up yet.
+        decimals = overview.decimals if overview.found and overview.decimals > 0 else None
+        if decimals is None:
+            decimals = await security.get_mint_decimals(mint)
+        if decimals is None:
+            decimals = 9
+            log.warning("Could not verify on-chain decimals for %s; defaulting to 9 (may be wrong)", mint)
+
+        # Entry price/token count: prefer the swap's own quoted fill (ground
+        # truth for what this buy actually paid) over a market snapshot taken
+        # moments *before* the trade, which is commonly 0 for a token that's
+        # only seconds old -- recording entry_price_usd=0 would silently
+        # disable Smart-SL/hard-SL forever for that position (division guards
+        # skip zero-entry positions rather than crash, so this failed quietly).
+        token_balance = None
+        entry_price_usd = overview.price_usd if overview.found else 0.0
+        if result.out_amount:
+            token_balance = result.out_amount / (10 ** decimals)
+            try:
+                sol_usd = await wallet.get_sol_usd_price()
+                spent_usd = sol_amount * sol_usd
+                if token_balance > 0 and spent_usd > 0:
+                    entry_price_usd = spent_usd / token_balance
+            except Exception:
+                pass
+        if not token_balance:
+            token_balance = await wallet.get_token_balance(mint)
+
+        st = await store.get_settings()
+        pos = Position(mint=mint, symbol=overview.symbol, entry_price_usd=entry_price_usd, amount_tokens=token_balance, decimals=decimals, take_profit_pct=st["default_tp_pct"], stop_loss_pct=st["default_sl_pct"])
+        await store.upsert_position(pos)
+        price_note = "" if entry_price_usd > 0 else "\n⚠️ Entry price unavailable yet — PnL/Smart-SL will pick it up once pricing data appears (use Refresh)."
+        await notice.edit_text(
+            f"✅ *Bought ${overview.symbol}*\nAmount: `{sol_amount:.9f} SOL`\nTx: `{result.signature}`\n\n📊 Live PnL is now available from the Live PnL button.{price_note}",
+            parse_mode="Markdown",
+        )
+    except Exception as exc:
+        log.exception("Buy failed: %s", type(exc).__name__)
+        await notice.edit_text("❌ Buy failed due to a temporary error. No wallet credential was exposed.")
+
+
+async def _positions_text_and_kb():
+    if not wallet.configured:
+        return "🔌 No wallet connected. Use /connect_wallet first.", _back_kb()
+    positions = await store.get_positions()
+    if not positions:
+        return "📊 *Live PnL*\n\nNo open positions.", InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="positions")], [InlineKeyboardButton("⬅ Back", callback_data="refresh_dashboard")]])
+    chunks = ["📊 *LIVE PnL • positions*", ""]
+    rows = []
+    for mint, pos in positions.items():
+        try:
+            overview = await security.get_token_overview(mint)
+            cur = overview.price_usd or pos.entry_price_usd
+            pnl = ((cur - pos.entry_price_usd) / pos.entry_price_usd * 100) if pos.entry_price_usd else 0
+            value = cur * pos.amount_tokens
+            smart = "—" if pos.smart_stop_profit_pct is None else ("BE" if pos.smart_stop_profit_pct == 0 else f"+{pos.smart_stop_profit_pct:.1f}%")
+            chunks.append(
+                f"*${pos.symbol}*\nEntry `${pos.entry_price_usd:.8f}` → Now `${cur:.8f}`\n"
+                f"PnL *{pnl:+.2f}%* • Value `${value:,.2f}`\n"
+                f"Hard SL `-{pos.stop_loss_pct}%` • Smart SL `{smart}`\n"
+                f"Mint `{mint[:8]}…{mint[-6:]}`"
+            )
+            rows.append([
+                InlineKeyboardButton("Sell 25%", callback_data=f"sell:{mint}:0.25"),
+                InlineKeyboardButton("Sell 50%", callback_data=f"sell:{mint}:0.50"),
+                InlineKeyboardButton("Sell 75%", callback_data=f"sell:{mint}:0.75"),
+            ])
+            rows.append([
+                InlineKeyboardButton("Sell 100%", callback_data=f"sell:{mint}:1.00"),
+                InlineKeyboardButton("✏️ Close %", callback_data=f"sellcustom:{mint}"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="positions"),
+            ])
+        except Exception as exc:
+            log.warning("Position display failed: %s", type(exc).__name__)
+            chunks.append(f"*${pos.symbol}*\n⚠️ Price temporarily unavailable")
+    rows.append([InlineKeyboardButton("🔄 Refresh Live PnL", callback_data="positions")])
+    rows.append([InlineKeyboardButton("🏠 Dashboard", callback_data="refresh_dashboard")])
+    return "\n\n".join(chunks), InlineKeyboardMarkup(rows)
+
+
+async def show_positions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, kb = await _positions_text_and_kb()
+    query = update.callback_query
+    _live_position_messages[query.message.chat_id] = query.message.message_id
+    await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+async def live_pnl_daemon(context: ContextTypes.DEFAULT_TYPE):
+    if not _live_position_messages or not wallet.configured:
+        return
+    text, kb = await _positions_text_and_kb()
+    for chat_id, message_id in list(_live_position_messages.items()):
+        try:
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, reply_markup=kb, parse_mode="Markdown")
+        except Exception:
+            pass
+
+
+async def do_sell(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str, fraction: float):
+    chat_id = update.effective_chat.id if update.effective_chat else update.callback_query.message.chat_id
+    if not wallet.configured:
+        await context.bot.send_message(chat_id, "🔌 No wallet connected. Use /connect_wallet first.")
+        return
+    if not 0 < fraction <= 1:
+        await context.bot.send_message(chat_id, "❌ Close percentage must be between 0.01% and 100%.")
+        return
+    pct = fraction * 100.0
+    notice = await context.bot.send_message(chat_id, f"⏳ Selling {pct:g}% of the recorded position...")
+    try:
+        positions = await store.get_positions()
+        pos = positions.get(mint)
+        if not pos:
+            await notice.edit_text("No recorded position for that token.")
+            return
+        balance = await wallet.get_token_balance(mint)
+        if balance <= 0:
+            await store.remove_position(mint)
+            await notice.edit_text("Wallet shows zero token balance already — clearing position.")
+            return
+        raw_units = int(balance * fraction * (10 ** pos.decimals))
+        if raw_units <= 0:
+            await notice.edit_text("❌ Close amount is too small for the token precision.")
+            return
+        result = await sell_token(mint, raw_units, pos.decimals)
+        if not result.success:
+            await notice.edit_text(result.error or "❌ Sell failed")
+            return
+        await store.reduce_position(mint, fraction)
+        if fraction >= 0.999999:
+            confirmation = f"✅ Closed 100% of ${pos.symbol}"
+        else:
+            confirmation = f"✅ Sold {pct:g}% of ${pos.symbol}"
+        await notice.edit_text(f"{confirmation}\nTx: `{result.signature}`", parse_mode="Markdown")
+    except Exception as exc:
+        log.exception("Sell failed: %s", type(exc).__name__)
+        await notice.edit_text("❌ Sell failed due to a temporary error.")
+
+
+def _close_position_kb(mint: str):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("25%", callback_data=f"sell:{mint}:0.25"), InlineKeyboardButton("50%", callback_data=f"sell:{mint}:0.50"), InlineKeyboardButton("75%", callback_data=f"sell:{mint}:0.75")],
+        [InlineKeyboardButton("100% Close", callback_data=f"sell:{mint}:1.00"), InlineKeyboardButton("✏️ Write %", callback_data=f"sellcustom:{mint}")],
+        [InlineKeyboardButton("⬅ Positions", callback_data="positions")],
+    ])
+
+
+def _back_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("⬅ Back", callback_data="refresh_dashboard")]])
+
+
+async def show_close_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str):
+    positions = await store.get_positions()
+    pos = positions.get(mint)
+    if not pos:
+        await update.callback_query.edit_message_text("No open position for this token.", reply_markup=_back_kb())
+        return
+    await update.callback_query.edit_message_text(
+        f"💼 *Close ${pos.symbol} position*\n\nChoose how much of the current token balance to sell:\n• 25%\n• 50%\n• 75%\n• 100%\n• Write any percentage from 0.01–100%",
+        reply_markup=_close_position_kb(mint),
+        parse_mode="Markdown",
+    )
+
+
+async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    st = await store.get_settings()
+    text = f"*Settings*\n\nSlippage: {st['slippage_bps']/100:.1f}%\nPriority fee: {st['priority_fee_microlamports']} microlamports\nDefault TP: +{st['default_tp_pct']}%\nDefault SL: -{st['default_sl_pct']}%"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("5%", callback_data="slip:500"), InlineKeyboardButton("15%", callback_data="slip:1500"), InlineKeyboardButton("25%", callback_data="slip:2500")], [InlineKeyboardButton("⬅ Back", callback_data="refresh_dashboard")]])
+    await update.callback_query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
+
+
+@admin_only
+async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data or ""
+    await query.answer()
+    if data == "refresh_dashboard":
+        await refresh_dashboard_cb(update, context)
+    elif data == "connect_wallet":
+        _awaiting_wallet_mnemonic.add(query.message.chat_id)
+        await query.edit_message_text("🔐 Send your recovery phrase in your next message. It will be validated and deleted when possible. Use /cancel_wallet to cancel.")
+    elif data == "disconnect_wallet":
+        wallet.disconnect()
+        await query.edit_message_text("🔌 Wallet disconnected.", reply_markup=_back_kb())
+    elif data == "positions":
+        await show_positions(update, context)
+    elif data == "settings":
+        await show_settings(update, context)
+    elif data == "toggle_sniper":
+        st = await store.get_settings()
+        await store.set_setting("auto_sniper_enabled", not st["auto_sniper_enabled"])
+        await refresh_dashboard_cb(update, context)
+    elif data == "cancel":
+        await query.edit_message_text("Cancelled.", reply_markup=_back_kb())
+    elif data.startswith("tokenrefresh:"):
+        _, mint = data.split(":", 1)
+        await refresh_token_cb(update, context, mint)
+    elif data.startswith("buy:"):
+        _, mint, amount = data.split(":")
+        await do_buy(update, context, mint, float(amount))
+    elif data.startswith("custom:"):
+        _, mint = data.split(":", 1)
+        _awaiting_custom_amount[query.message.chat_id] = mint
+        await query.edit_message_text(f"Enter the SOL amount to buy for `{mint[:8]}...`\n\nThe bot will preflight the transaction and show the exact SOL balance/top-up required if funds are insufficient.", parse_mode="Markdown")
+    elif data.startswith("closemenu:"):
+        _, mint = data.split(":", 1)
+        await show_close_menu(update, context, mint)
+    elif data.startswith("sellcustom:"):
+        _, mint = data.split(":", 1)
+        positions = await store.get_positions()
+        if mint not in positions:
+            await query.edit_message_text("No open position for that token.", reply_markup=_back_kb())
+            return
+        _awaiting_custom_sell_pct[query.message.chat_id] = mint
+        await query.edit_message_text(
+            f"✏️ *Manual position close*\n\nEnter the percentage to sell for `{mint[:8]}...`\n\nAllowed: `0.01` to `100`\nExamples: `25`, `37.5`, `82.25`, `100`",
+            parse_mode="Markdown",
+        )
+    elif data.startswith("sell:"):
+        _, mint, fraction = data.split(":")
+        await do_sell(update, context, mint, float(fraction))
+    elif data.startswith("slip:"):
+        _, bps = data.split(":")
+        await store.set_setting("slippage_bps", int(bps))
+        await show_settings(update, context)
+
+
+async def tp_sl_daemon(context: ContextTypes.DEFAULT_TYPE):
+    if not wallet.configured:
+        return
+    positions = await store.get_positions()
+    if not positions or not settings.admin_ids:
+        return
+    admin_id = next(iter(settings.admin_ids))
+    for mint, pos in positions.items():
+        try:
+            overview = await security.get_token_overview(mint)
+            if not overview.found or overview.price_usd <= 0:
+                continue
+            cur_price = overview.price_usd
+            pnl_pct = (cur_price - pos.entry_price_usd) / pos.entry_price_usd * 100
+            if pos.trailing_sl_pct:
+                if not pos.trailing_high_price or cur_price > pos.trailing_high_price:
+                    pos.trailing_high_price = cur_price
+                    await store.upsert_position(pos)
+                drawdown = (pos.trailing_high_price - cur_price) / pos.trailing_high_price * 100
+                if drawdown >= pos.trailing_sl_pct:
+                    await _auto_close(context, admin_id, mint, pos, f"Trailing SL hit (-{drawdown:.1f}% from high)")
+                    continue
+            if pos.take_profit_pct and pnl_pct >= pos.take_profit_pct:
+                await _auto_close(context, admin_id, mint, pos, f"Take-Profit hit (+{pnl_pct:.1f}%)")
+            elif pos.stop_loss_pct and pnl_pct <= -pos.stop_loss_pct:
+                await _auto_close(context, admin_id, mint, pos, f"Stop-Loss hit ({pnl_pct:.1f}%)")
+        except Exception as exc:
+            log.warning("TP/SL check failed: %s", type(exc).__name__)
+
+
+async def _auto_close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, pos: Position, reason: str):
+    try:
+        balance = await wallet.get_token_balance(mint)
+        if balance <= 0:
+            await store.remove_position(mint)
+            return
+        raw_units = int(balance * (10 ** pos.decimals))
+        result = await sell_token(mint, raw_units, pos.decimals)
+        if result.success:
+            await store.remove_position(mint)
+            await context.bot.send_message(admin_id, f"🤖 Auto-closed *${pos.symbol}* — {reason}\nTx: `{result.signature}`", parse_mode="Markdown")
+        else:
+            await context.bot.send_message(admin_id, f"⚠️ Auto-close FAILED for ${pos.symbol}: {result.error}")
+    except Exception as exc:
+        log.warning("Auto-close failed: %s", type(exc).__name__)
+
+
+def main():
+    settings.validate()
+    app = Application.builder().token(settings.telegram_token).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("connect_wallet", connect_wallet_cmd))
+    app.add_handler(CommandHandler("cancel_wallet", cancel_wallet_cmd))
+    app.add_handler(CommandHandler("disconnect_wallet", disconnect_wallet_cmd))
+    app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # NOTE: this interval also governs the auto-sniper's discovery poll (see
+    # launcher.py's combined_daemon) and smart-SL's price checks. It was
+    # previously hardcoded to 20 regardless of the documented
+    # AUTO_SNIPER_POLL_SECONDS setting, which was defined in config.py and
+    # listed in .env.example but never actually read anywhere -- changing it
+    # silently did nothing.
+    app.job_queue.run_repeating(tp_sl_daemon, interval=settings.auto_sniper_poll_seconds, first=10)
+    app.job_queue.run_repeating(live_pnl_daemon, interval=10, first=15)
+    log.info("Bot starting — whitelisted admins: %s", settings.admin_ids)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()

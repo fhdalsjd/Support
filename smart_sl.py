@@ -17,7 +17,7 @@ import time
 from telegram.ext import ContextTypes
 
 from config import settings
-from security import get_token_overview
+import security  # module import so sitecustomize.py's live-pricing patch is honored — see trading_bot.py for why
 from state import Position, store
 from trading import sell_token
 from wallet import wallet
@@ -47,7 +47,7 @@ async def _close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, p
         if exit_price is None:
             exit_price = pos.entry_price_usd
             try:
-                overview = await get_token_overview(mint)
+                overview = await security.get_token_overview(mint)
                 if overview.found and overview.price_usd > 0:
                     exit_price = overview.price_usd
             except Exception:
@@ -111,7 +111,36 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
     admin_id = next(iter(settings.admin_ids))
     for mint, pos in positions.items():
         try:
-            overview = await get_token_overview(mint)
+            overview = await security.get_token_overview(mint)
+
+            # Self-heal positions recorded under the old bug where decimals
+            # defaulted to a hardcoded 9 and entry price could be recorded as
+            # 0 for a token too new to have pricing data at buy time. Decimals
+            # is a fixed mint property, so this is a safe, fully-accurate fix
+            # whenever real data is available. Entry price can't be recovered
+            # retroactively -- backfilling with the current price isn't
+            # historically accurate, but it's strictly better than leaving
+            # Smart-SL/hard-SL permanently disabled for that position.
+            healed = False
+            if overview.found and overview.decimals > 0 and overview.decimals != pos.decimals:
+                log.warning("Correcting stored decimals for %s: %s -> %s", mint, pos.decimals, overview.decimals)
+                pos.decimals = overview.decimals
+                healed = True
+            if pos.entry_price_usd <= 0 and overview.found and overview.price_usd > 0:
+                pos.entry_price_usd = overview.price_usd
+                healed = True
+                try:
+                    await context.bot.send_message(
+                        admin_id,
+                        f"ℹ️ ${pos.symbol}: entry price was missing (likely bought before pricing data existed) — "
+                        f"backfilled at the current price so Smart-SL/hard-SL are now active. Historical PnL from "
+                        f"before this point is not recoverable.",
+                    )
+                except Exception:
+                    pass
+            if healed:
+                await store.upsert_position(pos)
+
             if not overview.found or overview.price_usd <= 0 or pos.entry_price_usd <= 0:
                 continue
 

@@ -211,6 +211,18 @@ async def _fetch_sol_pairs(mint: str) -> list[dict]:
     return list(unique.values())
 
 
+async def get_mint_decimals(mint: str) -> int | None:
+    """Dedicated on-chain decimals lookup, for when a full get_token_overview()
+    snapshot isn't available/cached yet but we still need a trustworthy decimals
+    value before recording a position (getting this wrong causes sells to
+    compute the wrong raw token amount -- see do_buy in trading_bot.py)."""
+    async with httpx.AsyncClient(timeout=10) as http:
+        result = await _rpc_call(http, "getTokenSupply", [mint])
+    value = (result or {}).get("value") or {}
+    decimals = _i(value.get("decimals"))
+    return decimals if decimals > 0 else None
+
+
 _OVERVIEW_CACHE_TTL_SECONDS = 5.0
 _OVERVIEW_CACHE: dict[str, tuple[float, TokenOverview]] = {}
 

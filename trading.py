@@ -41,6 +41,8 @@ class SwapResult:
     success: bool
     signature: str | None = None
     error: str | None = None
+    in_amount: int | None = None   # raw units of the input mint actually quoted (lamports for a buy)
+    out_amount: int | None = None  # raw units of the output mint actually quoted (raw token units for a buy)
 
 
 async def _request(method: str, url: str, **kwargs):
@@ -195,7 +197,7 @@ async def execute_swap(
         except Exception:
             pass
 
-    return SwapResult(success=True, signature=sig)
+    return SwapResult(success=True, signature=sig, in_amount=quote.in_amount, out_amount=quote.out_amount)
 
 
 async def send_jito_tip(lamports: int):

@@ -8,12 +8,65 @@ import threading
 import time
 from pathlib import Path
 
-import dashboard
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-
 log = logging.getLogger("launcher")
 BASE_DIR = Path(__file__).resolve().parent
-BOT_PATH = BASE_DIR / "bot.py"
+BOT_PATH = BASE_DIR / "trading_bot.py"
+SITECUSTOMIZE_PATH = BASE_DIR / "sitecustomize.py"
+
+
+def _load_sitecustomize_by_path() -> None:
+    """
+    Load this project's sitecustomize.py by explicit file path, unconditionally,
+    before anything else in this process imports `security`.
+
+    Two separate problems make relying on Python's automatic sitecustomize
+    mechanism unsafe here:
+
+    1. A `sitecustomize.py` sitting next to an entry script is NOT auto-loaded
+       just by running `python launcher.py`. The `site` module only tries
+       `import sitecustomize` using sys.path as it exists *during interpreter
+       startup* -- which happens BEFORE the script's own directory is added
+       to sys.path. Without PYTHONPATH pointing at this directory, this
+       project's sitecustomize.py was silently never imported at all.
+    2. Even where a `sitecustomize` module import *does* succeed automatically
+       (e.g. many Debian-based Python images, including python:3.11-slim-bookworm,
+       ship their own /usr/.../sitecustomize.py for dist-packages setup), that
+       unrelated module gets cached in sys.modules under the same name first --
+       so a later bare `import sitecustomize` would silently return THAT
+       module instead of this project's, since Python only ever imports one
+       module per name.
+
+    Loading by explicit file path sidesteps both: it doesn't depend on
+    sys.path timing and can't be shadowed by an unrelated same-named module.
+
+    This must run before `load_bot_module()` (and before importing sniper /
+    smart_sl), because `security.get_token_overview` is imported by name
+    (`import security`, called as `security.get_token_overview(...)`) in
+    trading_bot.py and smart_sl.py. The monkeypatch this file installs
+    (`security.get_token_overview = live_overview`) only affects code that
+    looks the function up on the `security` module *after* the patch is
+    applied -- so ordering here directly determines whether every token paste
+    gets the robust multi-source/live-pricing path or silently falls back to
+    the bare DexScreener-only lookup (which returns "found=False" for any
+    token DexScreener hasn't indexed yet -- i.e. most brand-new pump.fun
+    tokens, which is exactly what an auto-sniper pastes/buys).
+    """
+    if not SITECUSTOMIZE_PATH.exists():
+        log.warning("sitecustomize.py not found at %s -- live-pricing patch not applied", SITECUSTOMIZE_PATH)
+        return
+    spec = importlib.util.spec_from_file_location("_project_sitecustomize", SITECUSTOMIZE_PATH)
+    if spec is None or spec.loader is None:
+        log.warning("Could not load sitecustomize.py from %s", SITECUSTOMIZE_PATH)
+        return
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    log.info("Loaded project sitecustomize.py explicitly (live-pricing patch active)")
+
+
+_load_sitecustomize_by_path()
+
+import dashboard
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 
 def load_bot_module():
@@ -258,15 +311,27 @@ if __name__ == "__main__":
         await original_callback_router(update, context)
 
     bot_app.callback_router = guarded_callback_router
-    original_tp_sl_daemon = bot_app.tp_sl_daemon
+
+    # NOTE: trading_bot.py's own legacy `tp_sl_daemon` (fixed TP / trailing-SL)
+    # is intentionally NOT called here anymore. smart_sl.py's docstring states
+    # it is the complete, deterministic exit policy (hard SL + break-even +
+    # ratcheting profit lock), and its own tick() already reads/enforces
+    # `pos.stop_loss_pct` and actively nulls `pos.take_profit_pct` /
+    # `pos.trailing_sl_pct` on every position. Running both daemons back to
+    # back on the same 20s interval meant they both evaluated the same
+    # `stop_loss_pct` breach independently -- if smart_sl's own close attempt
+    # failed (e.g. a bad quote), the legacy daemon would immediately retry an
+    # independent, redundant close using its own history-less `_auto_close`
+    # helper in the same tick. Only smart_sl's exit path writes to permanent
+    # trade history, so keeping the legacy daemon in the loop also meant some
+    # closes silently never got recorded there.
 
     async def combined_daemon(context):
         await smart_sl.tick(context)
-        await original_tp_sl_daemon(context)
         await sniper.tick(context)
 
     bot_app.tp_sl_daemon = combined_daemon
     dashboard.set_bot(bot_app)
     threading.Thread(target=run_dashboard, name="web-dashboard", daemon=True).start()
-    log.info("Starting Telegram polling + smart SL + TP/SL + guarded auto-sniper")
+    log.info("Starting Telegram polling + smart SL + guarded auto-sniper")
     bot_app.main()
