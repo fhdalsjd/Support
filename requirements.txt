@@ -6,3 +6,4 @@ bip-utils==2.12.2
 httpx==0.27.2
 python-dotenv==1.0.1
 base58==2.1.1
+Pillow==10.4.0
