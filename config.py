@@ -71,6 +71,14 @@ class Settings:
     smart_sl_lock_ratio: float = _float("SMART_SL_LOCK_RATIO", 0.50)
     smart_sl_ratchet_step_pct: float = _float("SMART_SL_RATCHET_STEP_PCT", 2.0)
 
+    # Velocity panic exit: independent of PnL from entry. If price falls by
+    # this % within this rolling window, close immediately. Catches a fast
+    # crash from a local high (e.g. ran to +40%, then dumped 20% in 3
+    # minutes) that hard SL and the profit-lock ratchet can both miss, since
+    # neither reacts to *how fast* price is moving, only to fixed levels.
+    smart_sl_velocity_window_minutes: float = _float("SMART_SL_VELOCITY_WINDOW_MINUTES", 3.0)
+    smart_sl_velocity_drop_pct: float = _float("SMART_SL_VELOCITY_DROP_PCT", 15.0)
+
     rugcheck_api: str = os.getenv("RUGCHECK_API", "https://api.rugcheck.xyz/v1")
     state_file: str = os.getenv("STATE_FILE", "./state.json")
 
@@ -112,6 +120,10 @@ class Settings:
             errs.append("SMART_SL_PROFIT_LOCK_START_PCT must be >= SMART_SL_ACTIVATION_PCT")
         if self.smart_sl_ratchet_step_pct <= 0:
             errs.append("SMART_SL_RATCHET_STEP_PCT must be > 0")
+        if self.smart_sl_velocity_window_minutes <= 0:
+            errs.append("SMART_SL_VELOCITY_WINDOW_MINUTES must be > 0")
+        if self.smart_sl_velocity_drop_pct <= 0:
+            errs.append("SMART_SL_VELOCITY_DROP_PCT must be > 0")
         if self.default_slippage_bps <= 0 or self.default_slippage_bps > 5000:
             errs.append("DEFAULT_SLIPPAGE_BPS must be between 1 and 5000")
         if self.max_buy_sol <= 0:

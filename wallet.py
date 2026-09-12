@@ -122,11 +122,22 @@ class Wallet:
         return resp.value / LAMPORTS_PER_SOL
 
     async def get_sol_usd_price(self) -> float:
+        # Jupiter Price V3 is a flat {mint: {"usdPrice": ...}} response with no
+        # extra "/price" path segment. The previous version appended "/price"
+        # (a v2-era path) and read a "data"->mint->"price" shape that v3 does
+        # not return, so this silently raised on every call and the dashboard
+        # fell back to "balance unavailable". This matches the same
+        # request/response shape already used correctly in sitecustomize.py
+        # and market_snapshot.py.
+        mint = "So11111111111111111111111111111111111111112"
         async with httpx.AsyncClient(timeout=10) as http:
-            r = await http.get(settings.jupiter_price_api + "/price", params={"ids": "So11111111111111111111111111111111111111112"})
+            r = await http.get(settings.jupiter_price_api.rstrip("/"), params={"ids": mint})
             r.raise_for_status()
             data = r.json()
-            return float(data["data"]["So11111111111111111111111111111111111111112"]["price"])
+            value = (data.get(mint) or {}).get("usdPrice")
+            if value is None:
+                raise RuntimeError("Jupiter Price V3 response missing usdPrice for SOL")
+            return float(value)
 
     async def get_token_balance(self, mint: str) -> float:
         self._require_configured()

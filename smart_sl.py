@@ -2,7 +2,12 @@
 
 Exit policy:
 - No fixed take-profit.
-- Hard downside protection starts at -30% by default.
+- Velocity panic exit: if price falls SMART_SL_VELOCITY_DROP_PCT within
+  SMART_SL_VELOCITY_WINDOW_MINUTES, close immediately -- regardless of PnL
+  from entry. This is checked before everything else because it reacts to
+  *speed*, which neither of the two checks below do.
+- Hard downside protection starts at -30% by default (fixed level, from
+  entry price).
 - At +5% peak profit, stop moves to break-even.
 - At +10% peak profit, stop locks 50% of peak profit.
 - Thereafter the stop ratchets upward to 50% of the best profit reached,
@@ -23,6 +28,14 @@ from trading import sell_token
 from wallet import wallet
 
 log = logging.getLogger("smart-sl")
+
+# Per-mint rolling (timestamp, price) history for the velocity panic exit.
+# In-memory only and intentionally not persisted to state.json: it is a
+# short rolling window (a few minutes), so losing it on a restart just means
+# the window rebuilds from the next few ticks -- it never affects hard SL or
+# the profit-lock ratchet, which are both computed from pos.entry_price_usd
+# / pos.peak_profit_pct in state.json as before.
+_price_history: dict[str, list[tuple[float, float]]] = {}
 
 
 async def _close(context: ContextTypes.DEFAULT_TYPE, admin_id: int, mint: str, pos: Position, reason: str, exit_price: float | None = None):
@@ -106,7 +119,15 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
         return
     positions = await store.get_positions()
     if not positions:
+        _price_history.clear()
         return
+
+    # Drop history for any mint no longer an open position (e.g. closed by a
+    # manual sell from trading_bot.py, which this module has no other way of
+    # observing) so a later re-buy of the same mint starts a fresh window.
+    for stale_mint in list(_price_history.keys()):
+        if stale_mint not in positions:
+            _price_history.pop(stale_mint, None)
 
     admin_id = next(iter(settings.admin_ids))
     for mint, pos in positions.items():
@@ -156,6 +177,42 @@ async def tick(context: ContextTypes.DEFAULT_TYPE):
             # smart stop or hard protection closes them.
             pos.take_profit_pct = None
             pos.trailing_sl_pct = None
+
+            # 0. VELOCITY PANIC EXIT. Hard SL only fires once PnL from *entry*
+            # crosses -30%, and the profit-lock ratchet only protects the
+            # specific floor already locked -- so a token that ran to, say,
+            # +40% peak and then crashes 20% in a few minutes can slip
+            # through both: it's still net-positive from entry (hard SL
+            # blind to it) and the crash may not yet have reached the locked
+            # floor (ratchet blind to it too). This check reacts to the drop
+            # itself, independent of where entry or peak were.
+            now = time.time()
+            history = _price_history.setdefault(mint, [])
+            history.append((now, overview.price_usd))
+            window_seconds = settings.smart_sl_velocity_window_minutes * 60.0
+            cutoff = now - window_seconds
+            while len(history) > 1 and history[0][0] < cutoff:
+                history.pop(0)
+            # Require at least half the window of real history before
+            # evaluating, so a token bought seconds ago can't false-trigger
+            # off a single noisy price sample.
+            if len(history) >= 2 and (now - history[0][0]) >= window_seconds * 0.5:
+                window_high = max(p for _, p in history)
+                if window_high > 0:
+                    drop_pct = (window_high - overview.price_usd) / window_high * 100.0
+                    if drop_pct >= settings.smart_sl_velocity_drop_pct:
+                        await store.upsert_position(pos)
+                        await _close(
+                            context,
+                            admin_id,
+                            mint,
+                            pos,
+                            f"Velocity panic exit ({drop_pct:.1f}% drop in "
+                            f"{(now - history[0][0]) / 60.0:.1f}m)",
+                            overview.price_usd,
+                        )
+                        _price_history.pop(mint, None)
+                        continue
 
             # Hard downside protection. The default is -30%, but the recorded
             # position value is respected if an explicit positive SL exists.
