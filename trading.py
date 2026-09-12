@@ -2,8 +2,10 @@
 import asyncio
 import base64
 import re
-import httpx
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_FLOOR
+
+import httpx
 from solders.transaction import VersionedTransaction
 from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
@@ -18,6 +20,13 @@ JITO_TIP_ACCOUNTS = [
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
 ]
 INSUFFICIENT_RE = re.compile(r"insufficient lamports (\d+), need (\d+)", re.I)
+
+
+def to_raw_units(amount: float | Decimal | str, decimals: int) -> int:
+    """Safely convert UI token amount to raw integer units without float truncation."""
+    d_amount = Decimal(str(amount))
+    multiplier = Decimal(10) ** decimals
+    return int((d_amount * multiplier).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def _jupiter_base() -> str:
@@ -133,7 +142,6 @@ async def execute_swap(
     amount_lamports: int,
     slippage_bps: int | None = None,
     priority_fee_microlamports: int | None = None,
-    add_jito_tip: bool = False,
 ) -> SwapResult:
     slippage_bps = settings.default_slippage_bps if slippage_bps is None else slippage_bps
     priority_fee = settings.default_priority_fee_microlamports if priority_fee_microlamports is None else priority_fee_microlamports
@@ -188,21 +196,13 @@ async def execute_swap(
     except Exception as e:
         return SwapResult(success=False, error=f"Sent but not confirmed in time: {e} (sig={sig})")
 
-    # A Jito tip is deliberately opt-in. Sending a separate transfer after a
-    # confirmed swap does not improve that already-broadcast transaction and
-    # would create an unnecessary second spend.
-    if add_jito_tip and settings.jito_tip_lamports > 0:
-        try:
-            await send_jito_tip(settings.jito_tip_lamports)
-        except Exception:
-            pass
-
     return SwapResult(success=True, signature=sig, in_amount=quote.in_amount, out_amount=quote.out_amount)
 
 
 async def send_jito_tip(lamports: int):
+    """Utility to send a tip to Jito tip accounts (intended for bundled transactions)."""
     import random
-    if lamports <= 0:
+    if lamports <= 0 or not wallet.configured:
         return
     tip_account = Pubkey.from_string(random.choice(JITO_TIP_ACCOUNTS))
     ix = transfer(TransferParams(from_pubkey=wallet.pubkey, to_pubkey=tip_account, lamports=lamports))
@@ -222,8 +222,10 @@ async def buy_token(mint: str, sol_amount: float, slippage_bps: int | None = Non
         return SwapResult(success=False, error="Buy amount must be positive")
     if sol_amount > settings.max_buy_sol:
         return SwapResult(success=False, error=f"Amount exceeds MAX_BUY_SOL safety cap ({settings.max_buy_sol} SOL)")
-    lamports = int(sol_amount * LAMPORTS_PER_SOL)
-    return await execute_swap(SOL_MINT, mint, lamports, slippage_bps, add_jito_tip=False)
+    lamports = to_raw_units(sol_amount, 9)
+    if lamports <= 0:
+        return SwapResult(success=False, error="Buy amount in lamports is zero")
+    return await execute_swap(SOL_MINT, mint, lamports, slippage_bps)
 
 
 async def sell_token(mint: str, token_amount_raw: int, decimals: int, slippage_bps: int | None = None) -> SwapResult:
@@ -231,4 +233,4 @@ async def sell_token(mint: str, token_amount_raw: int, decimals: int, slippage_b
         return SwapResult(success=False, error="Sell amount must be positive")
     if decimals < 0 or decimals > 18:
         return SwapResult(success=False, error="Invalid token decimals")
-    return await execute_swap(mint, SOL_MINT, token_amount_raw, slippage_bps, add_jito_tip=False)
+    return await execute_swap(mint, SOL_MINT, token_amount_raw, slippage_bps)
