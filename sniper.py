@@ -78,11 +78,81 @@ def get_status() -> dict:
 
 
 async def _latest_profiles() -> list[dict]:
+    """Secondary discovery source: tokens whose creator submitted a
+    DexScreener profile. Kept as a fallback, but most brand-new pump.fun
+    mints never have a profile in their first hour, so this alone almost
+    always returns an empty/near-empty list -- see _pumpfun_newest_coins."""
     async with httpx.AsyncClient(timeout=10) as http:
         r = await http.get("https://api.dexscreener.com/token-profiles/latest/v1")
         r.raise_for_status()
         data = r.json()
         return data if isinstance(data, list) else []
+
+
+async def _pumpfun_newest_coins() -> list[dict]:
+    """Primary discovery source: pump.fun's own newest-launch feed.
+
+    Unlike DexScreener's token-profiles feed, this has no requirement that
+    the creator filled in a profile/socials -- it lists every new mint,
+    which is exactly the population a sniper needs to see. This hits an
+    unofficial/undocumented pump.fun endpoint, so it's wrapped defensively:
+    any failure or shape change just yields an empty list and the tick
+    falls back to whatever DexScreener returned.
+    """
+    url = "https://frontend-api-v3.pump.fun/coins"
+    params = {
+        "offset": 0,
+        "limit": 60,
+        "sort": "created_timestamp",
+        "order": "DESC",
+        "includeNsfw": "false",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            r = await http.get(url, params=params)
+            r.raise_for_status()
+            data = r.json()
+    except Exception as exc:
+        log.debug("pump.fun newest-coins feed unavailable: %s", type(exc).__name__)
+        return []
+
+    if isinstance(data, list):
+        coins = data
+    elif isinstance(data, dict):
+        coins = data.get("coins") or data.get("data") or []
+    else:
+        coins = []
+
+    out: list[dict] = []
+    for c in coins:
+        if not isinstance(c, dict):
+            continue
+        mint = c.get("mint") or c.get("tokenAddress") or c.get("address")
+        if mint:
+            out.append({"chainId": "solana", "tokenAddress": mint})
+    return out
+
+
+async def _discover_candidates() -> list[dict]:
+    """Merge every discovery source and de-duplicate by mint. Each source
+    fails independently -- one going down (or pump.fun changing its API)
+    never blocks the other from surfacing candidates."""
+    results = await asyncio.gather(
+        _pumpfun_newest_coins(), _latest_profiles(), return_exceptions=True
+    )
+    seen: set[str] = set()
+    merged: list[dict] = []
+    for batch in results:
+        if isinstance(batch, Exception):
+            log.warning("Auto-sniper discovery source failed: %s", type(batch).__name__)
+            continue
+        for profile in batch:
+            mint = profile.get("tokenAddress")
+            if not mint or mint in seen:
+                continue
+            seen.add(mint)
+            merged.append(profile)
+    return merged
 
 
 async def _auto_exposure_sol(positions: dict[str, Position]) -> float:
@@ -174,11 +244,7 @@ async def tick(context) -> None:
         if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
             return
 
-        try:
-            profiles = await _latest_profiles()
-        except Exception as exc:
-            log.warning("Auto-sniper discovery failed: %s", type(exc).__name__)
-            return
+        profiles = await _discover_candidates()
 
         now = time.time()
         _last_tick_candidates_seen = len(profiles)
