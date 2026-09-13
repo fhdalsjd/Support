@@ -380,13 +380,36 @@ async def tick(context) -> None:
 
         now = time.time()
         _last_tick_candidates_seen = len(profiles)
+        analyzed_count = 0
         for profile in profiles:
             if profile.get("chainId") != "solana":
                 continue
             mint = profile.get("tokenAddress")
             if not mint or now - _last_checked.get(mint, 0) < _RECHECK_SECONDS:
                 continue
+            if analyzed_count >= settings.auto_sniper_max_analyses_per_tick:
+                # Discovery now regularly returns 100+ candidates a pass
+                # across four sources. Analyzing every one of them in a
+                # single tick means 3-5 HTTP calls each (DexScreener,
+                # Jupiter, RugCheck, Solana RPC) fired back-to-back --
+                # hundreds of requests in a few seconds, which is exactly
+                # what was tripping "429 Too Many Requests" on every
+                # provider and making ticks run so long the next
+                # scheduled tick got skipped ("maximum number of running
+                # instances reached"). Capping per tick and leaving the
+                # rest for the next pass (the _last_checked cache below
+                # remembers what's already queued) keeps request volume
+                # sane without permanently skipping anything.
+                break
             _last_checked[mint] = now
+            analyzed_count += 1
+            if analyzed_count > 1:
+                # Space requests out instead of firing analyze_token() for
+                # every candidate back-to-back -- this is what actually
+                # avoids tripping DexScreener/Jupiter/RPC rate limits,
+                # regardless of which check below a given candidate exits
+                # on.
+                await asyncio.sleep(settings.auto_sniper_analysis_delay_seconds)
 
             try:
                 overview, rug, analysis = await analyze_token(mint)

@@ -74,6 +74,16 @@ class Settings:
     auto_sniper_max_age_minutes: int = _int("AUTO_SNIPER_MAX_AGE_MINUTES", 1440)
     auto_sniper_min_buy_sell_ratio: float = _float("AUTO_SNIPER_MIN_BUY_SELL_RATIO", 0.80)
     auto_sniper_slippage_bps: int = _int("AUTO_SNIPER_SLIPPAGE_BPS", 300)
+    # Discovery now merges 4 sources and can easily return 100+ candidates
+    # in a single pass. Analyzing all of them back-to-back was firing
+    # hundreds of DexScreener/Jupiter/RugCheck/RPC requests within seconds
+    # and tripping 429 rate limits on every provider, which in turn made
+    # ticks run long enough that the next scheduled tick got skipped. These
+    # two settings cap how many candidates get analyzed per tick and space
+    # the requests out; anything left over just gets picked up on the next
+    # pass (AUTO_SNIPER_POLL_SECONDS later).
+    auto_sniper_max_analyses_per_tick: int = _int("AUTO_SNIPER_MAX_ANALYSES_PER_TICK", 15)
+    auto_sniper_analysis_delay_seconds: float = _float("AUTO_SNIPER_ANALYSIS_DELAY_SECONDS", 0.75)
 
     # Smart SL: protect the original downside, move to break-even once proven,
     # then lock 50% of the best profit reached. The stop only moves upward.
