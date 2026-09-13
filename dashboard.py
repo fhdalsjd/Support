@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import base64
 import hmac
-import html
 import json
 import os
 import time
@@ -43,12 +42,14 @@ def _read_state() -> dict:
         return {}
 
 
-def _smart_sl_text(value):
-    if value is None:
-        return "—"
-    if value == 0:
-        return "BE"
-    return f"+{value:.1f}%"
+def _sniper_activity() -> dict:
+    sniper = getattr(BOT, "sniper", None)
+    if sniper is None or not hasattr(sniper, "get_status"):
+        return {"last_tick_at": None, "last_tick_candidates_seen": 0, "activity": []}
+    try:
+        return sniper.get_status()
+    except Exception:
+        return {"last_tick_at": None, "last_tick_candidates_seen": 0, "activity": []}
 
 
 def _status() -> dict:
@@ -73,49 +74,122 @@ def _status() -> dict:
         "slippage_bps": state.get("slippage_bps", getattr(settings, "default_slippage_bps", 500)),
         "positions": [{"mint": m, **p} for m, p in positions.items()],
         "history": history[:50], "uptime_seconds": int(time.time() - STARTED_AT),
+        "sniper": _sniper_activity(),
     }
 
 
-def _fmt_pnl(value):
-    if value is None:
-        return "—"
-    return f"{value:+.2f}%"
-
-
 def _page() -> bytes:
-    s = _status()
-    wallet_text = "Connected" if s["wallet_connected"] else "Not connected"
-    wallet_addr = s["wallet_address"] or "—"
-    if wallet_addr != "—":
-        wallet_addr = wallet_addr[:6] + "…" + wallet_addr[-6:]
-    sniper = "ON" if s["auto_sniper_enabled"] else "OFF"
-    allocation = f"{s['auto_sniper_allocation_pct']:g}%" if s["auto_sniper_allocation_pct"] is not None else "—"
-    pos_rows = "".join(
-        f"<tr><td><b>${html.escape(str(p.get('symbol','?')))}</b></td><td><code>{html.escape(str(p.get('mint','')))}</code></td>"
-        f"<td>${float(p.get('entry_price_usd',0)):.8f}</td><td>{float(p.get('amount_tokens',0)):.6f}</td>"
-        f"<td>Disabled</td><td>-{float(p.get('stop_loss_pct',30) or 30):g}%</td>"
-        f"<td>{_smart_sl_text(p.get('smart_stop_profit_pct'))}</td><td>+{float(p.get('peak_profit_pct',0)):.1f}%</td></tr>"
-        for p in s["positions"]
-    ) or '<tr><td colspan="8" class="muted">No open positions</td></tr>'
-    hist_rows = "".join(
-        f"<tr><td><b>${html.escape(str(h.get('symbol','?')))}</b></td><td><code>{html.escape(str(h.get('mint','')))}</code></td>"
-        f"<td>${float(h.get('entry_price_usd',0)):.8f}</td><td>${float(h.get('exit_price_usd',0) or 0):.8f}</td>"
-        f"<td><b>{_fmt_pnl(h.get('pnl_pct'))}</b></td><td>{html.escape(str(h.get('close_reason','—')))}</td>"
-        f"<td><code>{html.escape(str(h.get('sell_signature','')))}</code></td></tr>"
-        for h in s["history"]
-    ) or '<tr><td colspan="7" class="muted">No closed trades yet</td></tr>'
-    return f"""<!doctype html>
+    return """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solana Bot Live Dashboard</title>
 <style>
-body{{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-system,sans-serif}}main{{max-width:1400px;margin:auto;padding:24px}}h1{{margin:0 0 6px}}h2{{margin-top:28px}}.muted{{color:#8993a5}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}}.card{{background:#141821;border:1px solid #252c3a;border-radius:14px;padding:16px}}.value{{font-size:22px;font-weight:700;margin-top:8px}}.ok{{color:#52d273}}table{{width:100%;border-collapse:collapse;background:#141821;border-radius:14px;overflow:hidden}}th,td{{padding:11px;border-bottom:1px solid #252c3a;text-align:left;font-size:12px;vertical-align:top}}th{{color:#9da7b8}}code{{font-size:10px;word-break:break-all}}.note{{background:#17130a;border:1px solid #4d3b13;padding:14px;border-radius:12px;margin-top:18px}}.small{{font-size:12px;color:#8993a5}}
+body{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-system,sans-serif}
+main{max-width:1400px;margin:auto;padding:24px}
+h1{margin:0 0 6px}h2{margin-top:28px;display:flex;align-items:center;gap:10px}
+.muted{color:#8993a5}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}
+.card{background:#141821;border:1px solid #252c3a;border-radius:14px;padding:16px}
+.value{font-size:22px;font-weight:700;margin-top:8px}
+.ok{color:#52d273}
+table{width:100%;border-collapse:collapse;background:#141821;border-radius:14px;overflow:hidden}
+th,td{padding:11px;border-bottom:1px solid #252c3a;text-align:left;font-size:12px;vertical-align:top}
+th{color:#9da7b8;position:sticky;top:0;background:#141821}
+code{font-size:10px;word-break:break-all}
+.note{background:#17130a;border:1px solid #4d3b13;padding:14px;border-radius:12px;margin-top:18px}
+.small{font-size:12px;color:#8993a5}
+.tablewrap{max-height:420px;overflow-y:auto;border-radius:14px}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:700}
+.badge-bought{background:#123a21;color:#52d273}
+.badge-skipped{background:#241f0a;color:#e0b84d}
+.badge-error{background:#3a1414;color:#ef6a6a}
+.badge-buyfailed{background:#3a1414;color:#ef6a6a}
+.pulse{display:inline-block;width:9px;height:9px;border-radius:50%;background:#52d273;margin-right:6px;animation:pulse 1.4s infinite}
+@keyframes pulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}
 </style></head><body><main>
-<h1>Solana Trading Bot</h1><div class="muted">Live Railway service dashboard · refreshes every 5 seconds</div>
-{'<div class="note" style="background:#0a1f14;border-color:#1f4d2f"><b>🧪 DEMO MODE</b> — balances and trades below are simulated. No real funds, no real transactions.</div>' if s.get("paper_trading") else ''}
-<div class="grid"><div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div><div class="card"><div class="muted">Bot</div><div class="value">{"RUNNING" if s["bot_loaded"] else "OFFLINE"}</div></div><div class="card"><div class="muted">Wallet</div><div class="value">{wallet_text}</div><div class="small">{html.escape(wallet_addr)}</div></div><div class="card"><div class="muted">Auto-Sniper</div><div class="value">{sniper}</div><div class="small">Allocation: {allocation}</div></div><div class="card"><div class="muted">Open positions</div><div class="value">{len(s["positions"])}</div></div><div class="card"><div class="muted">Closed history</div><div class="value">{len(s["history"])}</div></div></div>
-<h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody>{pos_rows}</tbody></table>
-<h2>📚 Closed trade history</h2><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody>{hist_rows}</tbody></table>
+
+<h1>Solana Trading Bot</h1>
+<div class="muted"><span class="pulse" id="livedot"></span>Live · updates automatically, no page reload · last update <span id="t">just now</span></div>
+<div id="demoBanner"></div>
+
+<div class="grid" id="statCards"></div>
+
+<h2>🎯 Auto-Sniper activity <span class="small" id="sniperMeta"></span></h2>
+<div class="small">Every token the sniper looks at is listed below with the exact reason it passed or was skipped — updated live.</div><br>
+<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th></tr></thead><tbody id="activityBody"><tr><td colspan="5" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
+
+<h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br>
+<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody id="posBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table>
+
+<h2>📚 Closed trade history</h2>
+<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody id="histBody"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table>
+
 <div class="note"><b>Trade journal</b><br>Each completed trade keeps its entry snapshot, contract address, market/security data, entry and exit prices, close reason, peak/Smart-SL state, and buy/sell transaction signatures. The history is capped at 500 records and stored atomically in the bot state file.</div>
-<p class="small">No private key or recovery phrase is displayed. Last refresh: <span id="t"></span></p><script>document.getElementById('t').textContent=new Date().toLocaleTimeString();setTimeout(()=>location.reload(),5000);</script>
+<p class="small">No private key or recovery phrase is displayed.</p>
+
+<script>
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtPnl(v){ return v==null ? '—' : (v>=0?'+':'') + v.toFixed(2) + '%'; }
+function fmtSmartSl(v){ if(v==null) return '—'; if(v===0) return 'BE'; return '+'+v.toFixed(1)+'%'; }
+function shortAddr(a){ return (!a || a==='—') ? '—' : (a.length>14 ? a.slice(0,6)+'…'+a.slice(-6) : a); }
+function timeAgo(sec){
+  if(sec==null) return 'never';
+  const d = Math.max(0, Math.floor(Date.now()/1000 - sec));
+  if(d<2) return 'just now';
+  if(d<60) return d+'s ago';
+  if(d<3600) return Math.floor(d/60)+'m ago';
+  return Math.floor(d/3600)+'h ago';
+}
+const BADGE_CLASS = {BOUGHT:'badge-bought', SKIPPED:'badge-skipped', ERROR:'badge-error', BUY_FAILED:'badge-buyfailed'};
+
+function render(s){
+  document.getElementById('demoBanner').innerHTML = s.paper_trading
+    ? '<div class="note" style="background:#0a1f14;border-color:#1f4d2f"><b>🧪 DEMO MODE</b> — balances and trades below are simulated. No real funds, no real transactions.</div>' : '';
+
+  const walletText = s.wallet_connected ? 'Connected' : 'Not connected';
+  const walletAddr = shortAddr(s.wallet_address);
+  const sniperOn = s.auto_sniper_enabled ? 'ON' : 'OFF';
+  const allocation = (s.auto_sniper_allocation_pct!=null) ? (s.auto_sniper_allocation_pct+'%') : '—';
+  document.getElementById('statCards').innerHTML = `
+    <div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div>
+    <div class="card"><div class="muted">Bot</div><div class="value">${s.bot_loaded?'RUNNING':'OFFLINE'}</div></div>
+    <div class="card"><div class="muted">Wallet</div><div class="value">${walletText}</div><div class="small">${esc(walletAddr)}</div></div>
+    <div class="card"><div class="muted">Auto-Sniper</div><div class="value">${sniperOn}</div><div class="small">Allocation: ${esc(allocation)}</div></div>
+    <div class="card"><div class="muted">Open positions</div><div class="value">${s.positions.length}</div></div>
+    <div class="card"><div class="muted">Closed history</div><div class="value">${s.history.length}</div></div>`;
+
+  const sn = s.sniper || {last_tick_at:null, last_tick_candidates_seen:0, activity:[]};
+  document.getElementById('sniperMeta').textContent =
+    `— last scan ${timeAgo(sn.last_tick_at)} · ${sn.last_tick_candidates_seen||0} candidates in that pass`;
+  document.getElementById('activityBody').innerHTML = (sn.activity && sn.activity.length) ? sn.activity.map(a => `
+    <tr><td>${timeAgo(a.time)}</td><td><b>${esc(a.symbol||'?')}</b></td><td><code>${esc(a.mint)}</code></td>
+    <td><span class="badge ${BADGE_CLASS[a.verdict]||'badge-skipped'}">${esc(a.verdict)}</span></td><td>${esc(a.reason)}</td></tr>`
+  ).join('') : '<tr><td colspan="5" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
+
+  document.getElementById('posBody').innerHTML = (s.positions && s.positions.length) ? s.positions.map(p => `
+    <tr><td><b>$${esc(p.symbol||'?')}</b></td><td><code>${esc(p.mint||'')}</code></td>
+    <td>$${Number(p.entry_price_usd||0).toFixed(8)}</td><td>${Number(p.amount_tokens||0).toFixed(6)}</td>
+    <td>Disabled</td><td>-${Number(p.stop_loss_pct||30)}%</td><td>${fmtSmartSl(p.smart_stop_profit_pct)}</td>
+    <td>+${Number(p.peak_profit_pct||0).toFixed(1)}%</td></tr>`
+  ).join('') : '<tr><td colspan="8" class="muted">No open positions</td></tr>';
+
+  document.getElementById('histBody').innerHTML = (s.history && s.history.length) ? s.history.map(h => `
+    <tr><td><b>$${esc(h.symbol||'?')}</b></td><td><code>${esc(h.mint||'')}</code></td>
+    <td>$${Number(h.entry_price_usd||0).toFixed(8)}</td><td>$${Number(h.exit_price_usd||0).toFixed(8)}</td>
+    <td><b>${fmtPnl(h.pnl_pct)}</b></td><td>${esc(h.close_reason||'—')}</td><td><code>${esc(h.sell_signature||'')}</code></td></tr>`
+  ).join('') : '<tr><td colspan="7" class="muted">No closed trades yet</td></tr>';
+
+  document.getElementById('t').textContent = new Date().toLocaleTimeString();
+}
+
+async function refresh(){
+  try {
+    const r = await fetch('/api/status', {cache:'no-store'});
+    if(!r.ok) return;
+    render(await r.json());
+  } catch(e) { /* transient network hiccup -- next poll will retry */ }
+}
+refresh();
+setInterval(refresh, 2000);
+</script>
 </main></body></html>""".encode("utf-8")
 
 

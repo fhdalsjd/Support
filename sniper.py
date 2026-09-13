@@ -24,6 +24,33 @@ _last_buy_at = 0.0
 _RECHECK_SECONDS = 300
 _tick_lock = asyncio.Lock()
 
+# In-memory activity feed for the web dashboard (same process, see
+# launcher.py). Not persisted -- it only needs to show recent behaviour
+# while the process is up, and losing it on a restart is harmless.
+_ACTIVITY_LIMIT = 80
+_activity_log: list[dict] = []
+_last_tick_at: float | None = None
+_last_tick_candidates_seen = 0
+
+
+def _record(mint: str, symbol: str | None, verdict: str, reason: str, **extra):
+    entry = {"time": time.time(), "mint": mint, "symbol": symbol, "verdict": verdict, "reason": reason}
+    if extra:
+        entry.update(extra)
+    _activity_log.append(entry)
+    if len(_activity_log) > _ACTIVITY_LIMIT:
+        del _activity_log[: len(_activity_log) - _ACTIVITY_LIMIT]
+
+
+def get_status() -> dict:
+    """Read-only snapshot for the dashboard: is the sniper loop alive, and
+    what has it looked at / decided most recently."""
+    return {
+        "last_tick_at": _last_tick_at,
+        "last_tick_candidates_seen": _last_tick_candidates_seen,
+        "activity": list(reversed(_activity_log)),
+    }
+
 
 async def _latest_profiles() -> list[dict]:
     async with httpx.AsyncClient(timeout=10) as http:
@@ -84,13 +111,14 @@ def _entry_snapshot(overview, rug, analysis, allocation_pct: float, trade_amount
 
 
 async def tick(context) -> None:
-    global _last_buy_at
+    global _last_buy_at, _last_tick_at, _last_tick_candidates_seen
 
     if _tick_lock.locked():
         log.debug("Auto-sniper tick skipped: previous tick still active")
         return
 
     async with _tick_lock:
+        _last_tick_at = time.time()
         st = await store.get_settings()
         if not st.get("auto_sniper_enabled") or not wallet.configured:
             return
@@ -128,6 +156,7 @@ async def tick(context) -> None:
             return
 
         now = time.time()
+        _last_tick_candidates_seen = len(profiles)
         for profile in profiles:
             if profile.get("chainId") != "solana":
                 continue
@@ -138,16 +167,22 @@ async def tick(context) -> None:
 
             try:
                 overview, rug, analysis = await analyze_token(mint)
+                symbol = overview.symbol or None
                 if not overview.found or overview.price_usd <= 0:
+                    _record(mint, symbol, "SKIPPED", "No market data / price found")
                     continue
                 if overview.data_quality != "HIGH":
                     log.info("Auto-sniper blocked %s: data quality=%s warnings=%s", mint, overview.data_quality, overview.data_warnings)
+                    _record(mint, symbol, "SKIPPED", f"Data quality {overview.data_quality} (warnings: {', '.join(overview.data_warnings) or 'none'})")
                     continue
                 if overview.market_cap <= 0 or overview.total_supply <= 0 or overview.fdv <= 0:
+                    _record(mint, symbol, "SKIPPED", "Missing market cap / supply / FDV data")
                     continue
                 if not rug.mint_authority_revoked or not rug.freeze_authority_revoked:
+                    _record(mint, symbol, "SKIPPED", "Mint or freeze authority not revoked (rug risk)")
                     continue
                 if rug.top_holder_pct is None or rug.top_holder_pct > 10:
+                    _record(mint, symbol, "SKIPPED", f"Top holder concentration {rug.top_holder_pct if rug.top_holder_pct is not None else '?'}% (max 10%)")
                     continue
 
                 liquidity = overview.liquidity_usd
@@ -159,26 +194,36 @@ async def tick(context) -> None:
                 trades_5m = overview.total_trades_5m
 
                 if liquidity < settings.auto_sniper_min_liquidity_usd:
+                    _record(mint, symbol, "SKIPPED", f"Liquidity ${liquidity:,.0f} < min ${settings.auto_sniper_min_liquidity_usd:,.0f}")
                     continue
                 if market_cap < settings.auto_sniper_min_market_cap_usd:
+                    _record(mint, symbol, "SKIPPED", f"Market cap ${market_cap:,.0f} < min ${settings.auto_sniper_min_market_cap_usd:,.0f}")
                     continue
                 if volume_5m < settings.auto_sniper_min_volume_5m_usd:
+                    _record(mint, symbol, "SKIPPED", f"5m volume ${volume_5m:,.0f} < min ${settings.auto_sniper_min_volume_5m_usd:,.0f}")
                     continue
                 if overview.liquidity_mcap_pct < settings.auto_sniper_min_liquidity_mcap_pct:
+                    _record(mint, symbol, "SKIPPED", f"Liquidity/MC {overview.liquidity_mcap_pct:.1f}% < min {settings.auto_sniper_min_liquidity_mcap_pct:.1f}%")
                     continue
                 if change_5m <= 0 or change_5m > settings.auto_sniper_max_5m_change_pct:
+                    _record(mint, symbol, "SKIPPED", f"5m momentum {change_5m:+.1f}% outside allowed 0–{settings.auto_sniper_max_5m_change_pct:.0f}%")
                     continue
                 if age is None or age < settings.auto_sniper_min_age_minutes or age > settings.auto_sniper_max_age_minutes:
+                    _record(mint, symbol, "SKIPPED", f"Pool age {age if age is not None else '?'}m outside {settings.auto_sniper_min_age_minutes:g}–{settings.auto_sniper_max_age_minutes:g}m window")
                     continue
                 if trades_5m < 5:
+                    _record(mint, symbol, "SKIPPED", f"Only {trades_5m} trades in the last 5m (min 5)")
                     continue
                 if overview.sells_5m > 0 and ratio < settings.auto_sniper_min_buy_sell_ratio:
+                    _record(mint, symbol, "SKIPPED", f"Buy/Sell ratio {ratio:.2f} < min {settings.auto_sniper_min_buy_sell_ratio:.2f}")
                     continue
                 if analysis.risk_score > settings.auto_sniper_max_risk_score or rug.risk_level != "LOW":
+                    _record(mint, symbol, "SKIPPED", f"Risk score {analysis.risk_score}/100 (max {settings.auto_sniper_max_risk_score}), RugCheck {rug.risk_level}")
                     continue
 
                 current_positions = await store.get_positions()
                 if mint in current_positions or len(current_positions) >= settings.auto_sniper_max_positions:
+                    _record(mint, symbol, "SKIPPED", "Already holding this mint, or max concurrent positions reached")
                     continue
 
                 # Recalculate immediately before quoting.
@@ -187,26 +232,31 @@ async def tick(context) -> None:
                 remaining_exposure = settings.auto_sniper_max_exposure_sol - await _auto_exposure_sol(current_positions)
                 trade_amount = min(trade_amount, remaining_exposure)
                 if trade_amount <= 0 or balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
+                    _record(mint, symbol, "SKIPPED", "Insufficient spendable SOL after fee reserve / exposure cap")
                     continue
 
                 # Safe exact lamports conversion
                 quote_lamports = to_raw_units(trade_amount, 9)
                 quote = await get_quote(SOL_MINT, mint, quote_lamports, settings.auto_sniper_slippage_bps)
                 if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
+                    _record(mint, symbol, "SKIPPED", f"Jupiter price impact {quote.price_impact_pct:.1f}% > max {settings.auto_sniper_max_price_impact_pct:.1f}%")
                     continue
 
                 # One last balance check
                 available_sol_now, balance_now = await _available_trade_sol()
                 final_amount = min(available_sol_now * allocation_pct / 100.0, settings.max_buy_sol, remaining_exposure)
                 if final_amount <= 0 or balance_now - final_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
+                    _record(mint, symbol, "SKIPPED", "Balance changed before final check -- amount no longer affordable")
                     continue
                 if abs(final_amount - trade_amount) > 1e-9:
+                    _record(mint, symbol, "SKIPPED", "Balance shifted between checks (safety abort, will retry)")
                     continue
 
                 before_balance = await wallet.get_token_balance(mint)
                 result = await buy_token(mint, final_amount, settings.auto_sniper_slippage_bps)
                 if not result.success:
                     log.warning("Auto-sniper buy failed for %s: %s", mint, result.error)
+                    _record(mint, symbol, "BUY_FAILED", result.error or "Unknown execution error")
                     continue
 
                 try:
@@ -217,6 +267,7 @@ async def tick(context) -> None:
                 token_delta = max(0.0, after_balance - before_balance)
                 if token_delta <= 0:
                     log.error("Auto-buy confirmed but token balance delta is zero for %s", mint)
+                    _record(mint, symbol, "ERROR", "Buy confirmed but resulting balance could not be measured")
                     await context.bot.send_message(next(iter(settings.admin_ids)), f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`", parse_mode="Markdown")
                     return
 
@@ -236,6 +287,7 @@ async def tick(context) -> None:
                 )
                 await store.upsert_position(pos)
                 _last_buy_at = time.time()
+                _record(mint, symbol, "BOUGHT", f"Spent {final_amount:.4f} SOL @ ${overview.price_usd:.10f}", risk_score=analysis.risk_score)
                 await context.bot.send_message(
                     next(iter(settings.admin_ids)),
                     f"🤖 *AUTO-SNIPER BUY — POSITION OPEN*\n\n"
@@ -255,3 +307,4 @@ async def tick(context) -> None:
                 return
             except Exception as exc:
                 log.warning("Auto-sniper candidate check failed: %s", type(exc).__name__)
+                _record(mint, None, "ERROR", f"{type(exc).__name__}: {exc}")
