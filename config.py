@@ -82,7 +82,7 @@ class Settings:
     # two settings cap how many candidates get analyzed per tick and space
     # the requests out; anything left over just gets picked up on the next
     # pass (AUTO_SNIPER_POLL_SECONDS later).
-    auto_sniper_max_analyses_per_tick: int = _int("AUTO_SNIPER_MAX_ANALYSES_PER_TICK", 15)
+    auto_sniper_max_analyses_per_tick: int = _int("AUTO_SNIPER_MAX_ANALYSES_PER_TICK", 10)
     auto_sniper_analysis_delay_seconds: float = _float("AUTO_SNIPER_ANALYSIS_DELAY_SECONDS", 0.75)
 
     # Smart SL: protect the original downside, move to break-even once proven,

@@ -130,19 +130,39 @@ def _weighted_change(pairs: list[dict], window: str, volume_key: str) -> float:
     ) / total_volume
 
 
-async def _rpc_call(http: httpx.AsyncClient, method: str, params: list) -> dict | None:
-    try:
-        r = await http.post(
-            settings.rpc_url,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-        )
-        r.raise_for_status()
-        payload = r.json()
-        if payload.get("error"):
+async def _rpc_call(http: httpx.AsyncClient, method: str, params: list, retries: int = 2) -> dict | None:
+    """Call the configured Solana RPC, retrying briefly on 429.
+
+    _fetch_chain_snapshot fires 3 of these concurrently per candidate. The
+    public RPC endpoint's rate limit is tight enough that one of the three
+    commonly gets rejected with 429 even under light, well-spaced load --
+    and until now that just silently became a missing value (no mint/freeze
+    authority, no on-chain supply), which could make a perfectly fine token
+    look like its on-chain FDV "differs from the provider FDV" for no real
+    reason. A couple of short retries clears almost all of these.
+    """
+    for attempt in range(retries + 1):
+        try:
+            r = await http.post(
+                settings.rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+            )
+            if r.status_code == 429:
+                if attempt < retries:
+                    await asyncio.sleep(0.4 * (attempt + 1))
+                    continue
+                return None
+            r.raise_for_status()
+            payload = r.json()
+            if payload.get("error"):
+                return None
+            return payload.get("result")
+        except Exception:
+            if attempt < retries:
+                await asyncio.sleep(0.4 * (attempt + 1))
+                continue
             return None
-        return payload.get("result")
-    except Exception:
-        return None
+    return None
 
 
 async def _fetch_chain_snapshot(mint: str) -> dict:
