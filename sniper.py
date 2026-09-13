@@ -499,8 +499,8 @@ async def tick(context) -> None:
                 authority_ok = bool(rug.mint_authority_revoked) and bool(rug.freeze_authority_revoked)
                 add_check("Mint/Freeze authority revoked", authority_ok, "revoked" if authority_ok else "NOT revoked (rug risk)")
 
-                holder_ok = rug.top_holder_pct is not None and rug.top_holder_pct <= 10
-                add_check("Top holder concentration", holder_ok, f"{_fnum(rug.top_holder_pct)}% (max 10%)")
+                holder_ok = rug.top_holder_pct is not None and rug.top_holder_pct <= settings.auto_sniper_max_top_holder_pct
+                add_check("Top holder concentration", holder_ok, f"{_fnum(rug.top_holder_pct)}% (max {settings.auto_sniper_max_top_holder_pct:.0f}%)")
 
                 liquidity = overview.liquidity_usd or 0
                 liquidity_ok = liquidity >= settings.auto_sniper_min_liquidity_usd

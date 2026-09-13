@@ -74,6 +74,12 @@ class Settings:
     auto_sniper_max_age_minutes: int = _int("AUTO_SNIPER_MAX_AGE_MINUTES", 1440)
     auto_sniper_min_buy_sell_ratio: float = _float("AUTO_SNIPER_MIN_BUY_SELL_RATIO", 0.80)
     auto_sniper_slippage_bps: int = _int("AUTO_SNIPER_SLIPPAGE_BPS", 300)
+    # Was hardcoded at 10% -- brand-new pump.fun mints (a few minutes old)
+    # almost always have a single wallet (the creator's first buy) holding
+    # well over that until more organic buyers show up, so this alone was
+    # blocking nearly every fresh candidate regardless of any other
+    # threshold being loosened.
+    auto_sniper_max_top_holder_pct: float = _float("AUTO_SNIPER_MAX_TOP_HOLDER_PCT", 10.0)
     # "Other side" of the strategy: for a candidate that's already >= 1
     # hour old (i.e. not a fresh mint the age/5m-momentum checks above are
     # tuned for), also require a genuine 1-hour uptrend before buying --
