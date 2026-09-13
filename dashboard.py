@@ -81,10 +81,7 @@ def _status() -> dict:
     }
 
 
-def _page() -> bytes:
-    return """<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solana Bot Live Dashboard</title>
-<style>
+_STYLE = """
 body{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-system,sans-serif}
 main{max-width:1400px;margin:auto;padding:24px}
 h1{margin:0 0 6px}h2{margin-top:28px;display:flex;align-items:center;gap:10px}
@@ -112,32 +109,12 @@ code{font-size:10px;word-break:break-all}
 .logmsg{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;white-space:pre-wrap;word-break:break-word}
 .pulse{display:inline-block;width:9px;height:9px;border-radius:50%;background:#52d273;margin-right:6px;animation:pulse 1.4s infinite}
 @keyframes pulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}
-</style></head><body><main>
+nav.tabs{margin:14px 0 22px;display:flex;gap:8px}
+nav.tabs a{padding:8px 16px;border-radius:10px;text-decoration:none;font-weight:700;font-size:13px;color:#8993a5;background:#141821;border:1px solid #252c3a}
+nav.tabs a.active{color:#e9edf5;border-color:#3a4356;background:#1a2029}
+"""
 
-<h1>Solana Trading Bot</h1>
-<div class="muted"><span class="pulse" id="livedot"></span>Live · updates automatically, no page reload · last update <span id="t">just now</span></div>
-<div id="demoBanner"></div>
-
-<div class="grid" id="statCards"></div>
-
-<h2>🎯 Auto-Sniper activity <span class="small" id="sniperMeta"></span></h2>
-<div class="small">Every token the sniper looks at is listed below with the exact reason it passed or was skipped — updated live.</div><br>
-<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th><th>Price</th><th>Liquidity</th><th>MC</th><th>5m Vol</th><th>5m Δ</th><th>Age</th><th>Risk</th><th>RugCheck</th></tr></thead><tbody id="activityBody"><tr><td colspan="13" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
-
-<h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br>
-<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody id="posBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table>
-
-<h2>📚 Closed trade history</h2>
-<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody id="histBody"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table>
-
-<h2>📜 Live logs <span class="small" id="logsMeta"></span></h2>
-<div class="small">Same messages as the server/Railway logs, streamed here so you don't need to leave the dashboard.</div><br>
-<div class="tablewrap" id="logsWrap"><table><thead><tr><th style="width:90px">Time</th><th style="width:70px">Level</th><th style="width:110px">Source</th><th>Message</th></tr></thead><tbody id="logsBody"><tr><td colspan="4" class="muted">No log records yet.</td></tr></tbody></table></div>
-
-<div class="note"><b>Trade journal</b><br>Each completed trade keeps its entry snapshot, contract address, market/security data, entry and exit prices, close reason, peak/Smart-SL state, and buy/sell transaction signatures. The history is capped at 500 records and stored atomically in the bot state file.</div>
-<p class="small">No private key or recovery phrase is displayed.</p>
-
-<script>
+_JS_COMMON = """
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtPnl(v){ return v==null ? '—' : (v>=0?'+':'') + v.toFixed(2) + '%'; }
 function fmtSmartSl(v){ if(v==null) return '—'; if(v===0) return 'BE'; return '+'+v.toFixed(1)+'%'; }
@@ -152,8 +129,57 @@ function timeAgo(sec){
 }
 function fmtClock(sec){ return sec==null ? '—' : new Date(sec*1000).toLocaleTimeString(); }
 const BADGE_CLASS = {BOUGHT:'badge-bought', SKIPPED:'badge-skipped', ERROR:'badge-error', BUY_FAILED:'badge-buyfailed'};
+async function refresh(renderFn){
+  try {
+    const r = await fetch('/api/status', {cache:'no-store'});
+    if(!r.ok) return;
+    renderFn(await r.json());
+  } catch(e) { /* transient network hiccup -- next poll will retry */ }
+}
+"""
 
-function render(s){
+
+def _nav(active: str) -> str:
+    def cls(name):
+        return "active" if name == active else ""
+    return f"""<nav class="tabs">
+<a class="{cls('tokens')}" href="/tokens">🎯 Tokens</a>
+<a class="{cls('logs')}" href="/logs">📜 Logs</a>
+</nav>"""
+
+
+def _page_tokens() -> bytes:
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solana Bot — Tokens</title>
+<style>{_STYLE}</style></head><body><main>
+
+<h1>Solana Trading Bot</h1>
+<div class="muted"><span class="pulse" id="livedot"></span>Live · updates automatically, no page reload · last update <span id="t">just now</span></div>
+{_nav('tokens')}
+<div id="demoBanner"></div>
+
+<div class="grid" id="statCards"></div>
+
+<h2>🎯 Auto-Sniper activity <span class="small" id="sniperMeta"></span></h2>
+<div class="small">Every token the sniper looks at is listed below with the exact reason it passed or was skipped — updated live. System/error messages are on the <a href="/logs" style="color:#e9edf5">Logs</a> page.</div><br>
+<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th><th>Price</th><th>Liquidity</th><th>MC</th><th>5m Vol</th><th>5m Δ</th><th>Age</th><th>Risk</th><th>RugCheck</th></tr></thead><tbody id="activityBody"><tr><td colspan="13" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
+
+<h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br>
+<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody id="posBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table>
+
+<h2>📚 Closed trade history</h2>
+<table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody id="histBody"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table>
+
+<div class="note"><b>Trade journal</b><br>Each completed trade keeps its entry snapshot, contract address, market/security data, entry and exit prices, close reason, peak/Smart-SL state, and buy/sell transaction signatures. The history is capped at 500 records and stored atomically in the bot state file.</div>
+<p class="small">No private key or recovery phrase is displayed.</p>
+
+<script>
+{_JS_COMMON}
+function num(v, digits, prefix, suffix){{
+  if(v==null) return '—';
+  return (prefix||'') + Number(v).toLocaleString(undefined,{{minimumFractionDigits:digits,maximumFractionDigits:digits}}) + (suffix||'');
+}}
+function render(s){{
   document.getElementById('demoBanner').innerHTML = s.paper_trading
     ? '<div class="note" style="background:#0a1f14;border-color:#1f4d2f"><b>🧪 DEMO MODE</b> — balances and trades below are simulated. No real funds, no real transactions.</div>' : '';
 
@@ -163,61 +189,72 @@ function render(s){
   const allocation = (s.auto_sniper_allocation_pct!=null) ? (s.auto_sniper_allocation_pct+'%') : '—';
   document.getElementById('statCards').innerHTML = `
     <div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div>
-    <div class="card"><div class="muted">Bot</div><div class="value">${s.bot_loaded?'RUNNING':'OFFLINE'}</div></div>
-    <div class="card"><div class="muted">Wallet</div><div class="value">${walletText}</div><div class="small">${esc(walletAddr)}</div></div>
-    <div class="card"><div class="muted">Auto-Sniper</div><div class="value">${sniperOn}</div><div class="small">Allocation: ${esc(allocation)}</div></div>
-    <div class="card"><div class="muted">Open positions</div><div class="value">${s.positions.length}</div></div>
-    <div class="card"><div class="muted">Closed history</div><div class="value">${s.history.length}</div></div>`;
+    <div class="card"><div class="muted">Bot</div><div class="value">${{s.bot_loaded?'RUNNING':'OFFLINE'}}</div></div>
+    <div class="card"><div class="muted">Wallet</div><div class="value">${{walletText}}</div><div class="small">${{esc(walletAddr)}}</div></div>
+    <div class="card"><div class="muted">Auto-Sniper</div><div class="value">${{sniperOn}}</div><div class="small">Allocation: ${{esc(allocation)}}</div></div>
+    <div class="card"><div class="muted">Open positions</div><div class="value">${{s.positions.length}}</div></div>
+    <div class="card"><div class="muted">Closed history</div><div class="value">${{s.history.length}}</div></div>`;
 
-  const sn = s.sniper || {last_tick_at:null, last_tick_candidates_seen:0, activity:[]};
+  const sn = s.sniper || {{last_tick_at:null, last_tick_candidates_seen:0, activity:[]}};
   document.getElementById('sniperMeta').textContent =
-    `— last scan ${timeAgo(sn.last_tick_at)} · ${sn.last_tick_candidates_seen||0} candidates in that pass`;
-  function num(v, digits, prefix, suffix){
-    if(v==null) return '—';
-    return (prefix||'') + Number(v).toLocaleString(undefined,{minimumFractionDigits:digits,maximumFractionDigits:digits}) + (suffix||'');
-  }
+    `— last scan ${{timeAgo(sn.last_tick_at)}} · ${{sn.last_tick_candidates_seen||0}} candidates in that pass`;
   document.getElementById('activityBody').innerHTML = (sn.activity && sn.activity.length) ? sn.activity.map(a => `
-    <tr><td>${timeAgo(a.time)}</td><td><b>${esc(a.symbol||'?')}</b></td><td><code>${esc(a.mint)}</code></td>
-    <td><span class="badge ${BADGE_CLASS[a.verdict]||'badge-skipped'}">${esc(a.verdict)}</span></td><td>${esc(a.reason)}</td>
-    <td>${a.price_usd!=null? '$'+Number(a.price_usd).toFixed(10):'—'}</td>
-    <td>${num(a.liquidity_usd,0,'$')}</td><td>${num(a.market_cap_usd,0,'$')}</td>
-    <td>${num(a.volume_5m_usd,0,'$')}</td><td>${a.change_5m_pct!=null? num(a.change_5m_pct,1,'',' %'):'—'}</td>
-    <td>${a.age_minutes!=null? Math.round(a.age_minutes)+'m':'—'}</td>
-    <td>${a.risk_score!=null? a.risk_score+'/100':'—'}</td><td>${esc(a.rug_level||'—')}</td></tr>`
+    <tr><td>${{timeAgo(a.time)}}</td><td><b>${{esc(a.symbol||'?')}}</b></td><td><code>${{esc(a.mint)}}</code></td>
+    <td><span class="badge ${{BADGE_CLASS[a.verdict]||'badge-skipped'}}">${{esc(a.verdict)}}</span></td><td>${{esc(a.reason)}}</td>
+    <td>${{a.price_usd!=null? '$'+Number(a.price_usd).toFixed(10):'—'}}</td>
+    <td>${{num(a.liquidity_usd,0,'$')}}</td><td>${{num(a.market_cap_usd,0,'$')}}</td>
+    <td>${{num(a.volume_5m_usd,0,'$')}}</td><td>${{a.change_5m_pct!=null? num(a.change_5m_pct,1,'',' %'):'—'}}</td>
+    <td>${{a.age_minutes!=null? Math.round(a.age_minutes)+'m':'—'}}</td>
+    <td>${{a.risk_score!=null? a.risk_score+'/100':'—'}}</td><td>${{esc(a.rug_level||'—')}}</td></tr>`
   ).join('') : '<tr><td colspan="13" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
 
   document.getElementById('posBody').innerHTML = (s.positions && s.positions.length) ? s.positions.map(p => `
-    <tr><td><b>$${esc(p.symbol||'?')}</b></td><td><code>${esc(p.mint||'')}</code></td>
-    <td>$${Number(p.entry_price_usd||0).toFixed(8)}</td><td>${Number(p.amount_tokens||0).toFixed(6)}</td>
-    <td>Disabled</td><td>-${Number(p.stop_loss_pct||30)}%</td><td>${fmtSmartSl(p.smart_stop_profit_pct)}</td>
-    <td>+${Number(p.peak_profit_pct||0).toFixed(1)}%</td></tr>`
+    <tr><td><b>${{esc(p.symbol||'?')}}</b></td><td><code>${{esc(p.mint||'')}}</code></td>
+    <td>${{Number(p.entry_price_usd||0).toFixed(8)}}</td><td>${{Number(p.amount_tokens||0).toFixed(6)}}</td>
+    <td>Disabled</td><td>-${{Number(p.stop_loss_pct||30)}}%</td><td>${{fmtSmartSl(p.smart_stop_profit_pct)}}</td>
+    <td>+${{Number(p.peak_profit_pct||0).toFixed(1)}}%</td></tr>`
   ).join('') : '<tr><td colspan="8" class="muted">No open positions</td></tr>';
 
   document.getElementById('histBody').innerHTML = (s.history && s.history.length) ? s.history.map(h => `
-    <tr><td><b>$${esc(h.symbol||'?')}</b></td><td><code>${esc(h.mint||'')}</code></td>
-    <td>$${Number(h.entry_price_usd||0).toFixed(8)}</td><td>$${Number(h.exit_price_usd||0).toFixed(8)}</td>
-    <td><b>${fmtPnl(h.pnl_pct)}</b></td><td>${esc(h.close_reason||'—')}</td><td><code>${esc(h.sell_signature||'')}</code></td></tr>`
+    <tr><td><b>${{esc(h.symbol||'?')}}</b></td><td><code>${{esc(h.mint||'')}}</code></td>
+    <td>${{Number(h.entry_price_usd||0).toFixed(8)}}</td><td>${{Number(h.exit_price_usd||0).toFixed(8)}}</td>
+    <td><b>${{fmtPnl(h.pnl_pct)}}</b></td><td>${{esc(h.close_reason||'—')}}</td><td><code>${{esc(h.sell_signature||'')}}</code></td></tr>`
   ).join('') : '<tr><td colspan="7" class="muted">No closed trades yet</td></tr>';
 
-  const logs = s.logs || [];
-  document.getElementById('logsMeta').textContent = logs.length ? `— ${logs.length} recent entries` : '';
-  document.getElementById('logsBody').innerHTML = logs.length ? logs.map(l => `
-    <tr><td>${fmtClock(l.time)}</td><td class="lvl-${esc(l.level)}">${esc(l.level)}</td>
-    <td>${esc(l.logger)}</td><td class="logmsg">${esc(l.message)}</td></tr>`
-  ).join('') : '<tr><td colspan="4" class="muted">No log records yet.</td></tr>';
-
   document.getElementById('t').textContent = new Date().toLocaleTimeString();
-}
+}}
+refresh(render);
+setInterval(() => refresh(render), 2000);
+</script>
+</main></body></html>""".encode("utf-8")
 
-async function refresh(){
-  try {
-    const r = await fetch('/api/status', {cache:'no-store'});
-    if(!r.ok) return;
-    render(await r.json());
-  } catch(e) { /* transient network hiccup -- next poll will retry */ }
-}
-refresh();
-setInterval(refresh, 2000);
+
+def _page_logs() -> bytes:
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Solana Bot — Logs</title>
+<style>{_STYLE}</style></head><body><main>
+
+<h1>Solana Trading Bot</h1>
+<div class="muted"><span class="pulse" id="livedot"></span>Live · updates automatically, no page reload · last update <span id="t">just now</span></div>
+{_nav('logs')}
+
+<h2>📜 Live logs <span class="small" id="logsMeta"></span></h2>
+<div class="small">Same messages as the server/Railway logs, streamed here so you don't need to leave the dashboard. This page is system/error output only — token/candidate activity is on the <a href="/tokens" style="color:#e9edf5">Tokens</a> page.</div><br>
+<div class="tablewrap" id="logsWrap"><table><thead><tr><th style="width:90px">Time</th><th style="width:70px">Level</th><th style="width:110px">Source</th><th>Message</th></tr></thead><tbody id="logsBody"><tr><td colspan="4" class="muted">No log records yet.</td></tr></tbody></table></div>
+
+<script>
+{_JS_COMMON}
+function render(s){{
+  const logs = s.logs || [];
+  document.getElementById('logsMeta').textContent = logs.length ? `— ${{logs.length}} recent entries` : '';
+  document.getElementById('logsBody').innerHTML = logs.length ? logs.map(l => `
+    <tr><td>${{fmtClock(l.time)}}</td><td class="lvl-${{esc(l.level)}}">${{esc(l.level)}}</td>
+    <td>${{esc(l.logger)}}</td><td class="logmsg">${{esc(l.message)}}</td></tr>`
+  ).join('') : '<tr><td colspan="4" class="muted">No log records yet.</td></tr>';
+  document.getElementById('t').textContent = new Date().toLocaleTimeString();
+}}
+refresh(render);
+setInterval(() => refresh(render), 2000);
 </script>
 </main></body></html>""".encode("utf-8")
 
@@ -235,8 +272,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(401); self.send_header("WWW-Authenticate", 'Basic realm="Solana Bot Dashboard"'); self.end_headers(); return
         if path == "/api/status":
             self._send(200, json.dumps(_status()).encode(), "application/json; charset=utf-8"); return
-        if path in ("/", "/dashboard"):
-            self._send(200, _page()); return
+        if path == "/logs":
+            self._send(200, _page_logs()); return
+        if path in ("/", "/dashboard", "/tokens"):
+            self._send(200, _page_tokens()); return
         self._send(404, b"not found", "text/plain; charset=utf-8")
 
 

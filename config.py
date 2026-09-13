@@ -74,6 +74,13 @@ class Settings:
     auto_sniper_max_age_minutes: int = _int("AUTO_SNIPER_MAX_AGE_MINUTES", 1440)
     auto_sniper_min_buy_sell_ratio: float = _float("AUTO_SNIPER_MIN_BUY_SELL_RATIO", 0.80)
     auto_sniper_slippage_bps: int = _int("AUTO_SNIPER_SLIPPAGE_BPS", 300)
+    # "Other side" of the strategy: for a candidate that's already >= 1
+    # hour old (i.e. not a fresh mint the age/5m-momentum checks above are
+    # tuned for), also require a genuine 1-hour uptrend before buying --
+    # this is what actually distinguishes an established, currently-trending
+    # token from one that's merely old and stagnant or old and dumping.
+    auto_sniper_trend_check_age_minutes: int = _int("AUTO_SNIPER_TREND_CHECK_AGE_MINUTES", 60)
+    auto_sniper_min_1h_change_pct: float = _float("AUTO_SNIPER_MIN_1H_CHANGE_PCT", 5.0)
     # Discovery now merges 4 sources and can easily return 100+ candidates
     # in a single pass. Analyzing all of them back-to-back was firing
     # hundreds of DexScreener/Jupiter/RugCheck/RPC requests within seconds

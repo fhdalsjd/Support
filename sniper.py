@@ -209,6 +209,55 @@ async def _pumpfun_about_to_graduate() -> list[dict]:
     return out
 
 
+async def _geckoterminal_trending() -> list[dict]:
+    """Fifth discovery source, and a genuinely different population from
+    the pump.fun feeds above: tokens that already have a real, established
+    pool and are *currently trending* on GeckoTerminal -- i.e. the "other
+    side" of the strategy the user asked for. pump.fun's feeds are biased
+    toward brand-new mints; this one surfaces tokens that have already
+    been trading for a while and are seeing rising interest right now,
+    which is what the new 1h-trend gate below (auto_sniper_min_1h_change_pct)
+    is meant to confirm before buying.
+    """
+    url = "https://api.geckoterminal.com/api/v2/networks/solana/trending_pools"
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_BROWSER_HEADERS) as http:
+            r = await http.get(url, params={"include": "base_token"})
+            if r.status_code != 200:
+                log.warning(
+                    "GeckoTerminal trending-pools feed returned HTTP %s: %s",
+                    r.status_code, r.text[:200].replace("\n", " "),
+                )
+                return []
+            data = r.json()
+    except Exception as exc:
+        log.warning("GeckoTerminal trending-pools feed unavailable: %s: %s", type(exc).__name__, exc)
+        return []
+
+    if not isinstance(data, dict):
+        return []
+
+    included = {
+        item.get("id"): item
+        for item in (data.get("included") or [])
+        if isinstance(item, dict)
+    }
+
+    out: list[dict] = []
+    for pool in data.get("data") or []:
+        if not isinstance(pool, dict):
+            continue
+        try:
+            token_ref = pool["relationships"]["base_token"]["data"]
+            token_obj = included.get(token_ref.get("id"))
+            address = (token_obj or {}).get("attributes", {}).get("address")
+        except (KeyError, TypeError, AttributeError):
+            address = None
+        if address:
+            out.append({"chainId": "solana", "tokenAddress": address})
+    return out
+
+
 async def _dexscreener_boosted() -> list[dict]:
     """Tertiary source: DexScreener's boosted-token feed. Projects pay to
     boost, which in practice means they already have a real pool and are
@@ -233,10 +282,10 @@ async def _dexscreener_boosted() -> list[dict]:
 
 async def _discover_candidates() -> list[dict]:
     """Merge every discovery source and de-duplicate by mint. Each source
-    fails independently -- one going down (or pump.fun changing its API)
-    never blocks the others from surfacing candidates.
+    fails independently -- one going down (or an API changing shape) never
+    blocks the others from surfacing candidates.
 
-    Four sources, deliberately covering different populations:
+    Five sources, deliberately covering different populations:
       - pump.fun newest: seconds-old mints (mostly pre-liquidity, filtered
         out downstream by the data-quality gate -- but this is the only
         source that ever sees a token in its first minutes at all)
@@ -244,10 +293,14 @@ async def _discover_candidates() -> list[dict]:
         closest to (or already past) graduating to a real Raydium pool
       - DexScreener profiles: tokens with a creator-submitted profile
       - DexScreener boosts: tokens whose project paid to boost visibility
+      - GeckoTerminal trending: already-established pools currently seeing
+        rising interest -- the "hold what's trending up" side of the
+        strategy, gated below by the 1h-trend check rather than treated
+        like a brand-new mint
     """
-    pumpfun_new, pumpfun_koth, dex_profiles, dex_boosts = await asyncio.gather(
+    pumpfun_new, pumpfun_koth, dex_profiles, dex_boosts, gt_trending = await asyncio.gather(
         _pumpfun_newest_coins(), _pumpfun_about_to_graduate(),
-        _latest_profiles(), _dexscreener_boosted(),
+        _latest_profiles(), _dexscreener_boosted(), _geckoterminal_trending(),
         return_exceptions=True,
     )
     seen: set[str] = set()
@@ -257,6 +310,7 @@ async def _discover_candidates() -> list[dict]:
         ("pump.fun-koth", pumpfun_koth),
         ("dexscreener-profiles", dex_profiles),
         ("dexscreener-boosts", dex_boosts),
+        ("geckoterminal-trending", gt_trending),
     )
     for source_name, batch in sources:
         if isinstance(batch, Exception):
@@ -269,7 +323,7 @@ async def _discover_candidates() -> list[dict]:
             seen.add(mint)
             merged.append(profile)
     log.info(
-        "Auto-sniper discovery: pump.fun-newest=%d pump.fun-koth=%d dexscreener-profiles=%d dexscreener-boosts=%d merged_unique=%d",
+        "Auto-sniper discovery: pump.fun-newest=%d pump.fun-koth=%d dexscreener-profiles=%d dexscreener-boosts=%d geckoterminal-trending=%d merged_unique=%d",
         *(len(b) if isinstance(b, list) else -1 for _, b in sources),
         len(merged),
     )
@@ -457,6 +511,16 @@ async def tick(context) -> None:
                 if age is None or age < settings.auto_sniper_min_age_minutes or age > settings.auto_sniper_max_age_minutes:
                     _record(mint, symbol, "SKIPPED", f"Pool age {age if age is not None else '?'}m outside {settings.auto_sniper_min_age_minutes:g}–{settings.auto_sniper_max_age_minutes:g}m window", **_analysis_snapshot(overview, rug, analysis))
                     continue
+                # "Other side" of the strategy: a token old enough to have a
+                # real 1h history (as opposed to a fresh mint still being
+                # judged on 5m momentum alone) must also show a genuine 1h
+                # uptrend -- i.e. its market cap/price has actually been
+                # rising over the last hour, not just old and flat/dumping.
+                if age >= settings.auto_sniper_trend_check_age_minutes:
+                    change_1h = overview.change_1h
+                    if change_1h is None or change_1h < settings.auto_sniper_min_1h_change_pct:
+                        _record(mint, symbol, "SKIPPED", f"1h trend {change_1h if change_1h is not None else '?'}% below min +{settings.auto_sniper_min_1h_change_pct:.0f}% (established token not currently trending up)", **_analysis_snapshot(overview, rug, analysis))
+                        continue
                 if trades_5m < 5:
                     _record(mint, symbol, "SKIPPED", f"Only {trades_5m} trades in the last 5m (min 5)", **_analysis_snapshot(overview, rug, analysis))
                     continue
