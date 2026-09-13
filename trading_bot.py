@@ -1,6 +1,7 @@
 """Telegram trading UI with live token views, PnL refresh, and safe wallet flows."""
 from __future__ import annotations
 
+import asyncio
 import functools
 import logging
 import re
@@ -648,6 +649,235 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_settings(update, context)
 
 
+# ---------------------------------------------------------------------------
+# Web dashboard bridge. The dashboard's HTTP server runs on its own thread
+# with its own request-per-thread model, but every trading call (quotes,
+# swaps, RPC balance reads) is async and lives on this module's Telegram
+# event loop. We capture that running loop once at startup and marshal every
+# dashboard-triggered action onto it with run_coroutine_threadsafe, so the
+# same wallet/session objects are always used from the same loop.
+# ---------------------------------------------------------------------------
+EVENT_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+async def _capture_event_loop(context: ContextTypes.DEFAULT_TYPE):
+    global EVENT_LOOP
+    EVENT_LOOP = asyncio.get_running_loop()
+
+
+def run_dashboard_coro(coro, timeout: float = 30.0):
+    """Run an async action on the bot's event loop from the dashboard's HTTP thread."""
+    if EVENT_LOOP is None:
+        raise RuntimeError("Bot is still starting up — try again in a moment.")
+    future = asyncio.run_coroutine_threadsafe(coro, EVENT_LOOP)
+    return future.result(timeout=timeout)
+
+
+async def dashboard_lookup(raw_text: str) -> dict:
+    """Resolve pasted/typed text to a token and return a preview for the dashboard's buy panel."""
+    mint = _extract_mint((raw_text or "").strip())
+    if not mint:
+        return {"ok": False, "error": "Couldn't find a Solana token address in that text."}
+    try:
+        overview = await security.get_token_overview(mint)
+    except Exception as exc:
+        log.warning("Dashboard lookup failed: %s", type(exc).__name__)
+        return {"ok": False, "error": "Live token lookup failed. Please try again."}
+    if not overview.found:
+        return {"ok": False, "error": "No market data found for this mint yet. It may be too new or have no usable liquidity."}
+    try:
+        rug = await security.get_rug_verdict(mint)
+    except Exception:
+        rug = None
+    positions = await store.get_positions()
+    pos = positions.get(mint)
+    wallet_balance = None
+    if wallet.configured:
+        try:
+            wallet_balance = await wallet.get_token_balance(mint)
+        except Exception:
+            wallet_balance = None
+    return {
+        "ok": True,
+        "mint": mint,
+        "name": overview.name,
+        "symbol": overview.symbol,
+        "price_usd": overview.price_usd,
+        "market_cap_usd": overview.market_cap,
+        "liquidity_usd": overview.liquidity_usd,
+        "change_5m_pct": overview.change_5m,
+        "change_1h_pct": overview.change_1h,
+        "dex": overview.dex,
+        "risk_level": getattr(rug, "risk_level", "UNKNOWN"),
+        "risk_score": getattr(rug, "risk_score", None),
+        "notes": list(getattr(rug, "notes", []) or [])[:5],
+        "has_position": bool(pos),
+        "wallet_balance_tokens": wallet_balance,
+        "wallet_connected": bool(wallet.configured),
+        "max_buy_sol": settings.max_buy_sol,
+    }
+
+
+async def dashboard_buy(mint: str, sol_amount) -> dict:
+    """Same buy path as the Telegram flow (do_buy), returned as JSON instead of chat messages."""
+    mint = (mint or "").strip()
+    if not MINT_RE.fullmatch(mint or ""):
+        return {"ok": False, "error": "Invalid token address."}
+    if not wallet.configured:
+        return {"ok": False, "error": "No wallet connected. Use /connect_wallet in Telegram first."}
+    try:
+        sol_amount = float(sol_amount)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Invalid SOL amount."}
+    if sol_amount <= 0 or sol_amount > settings.max_buy_sol:
+        return {"ok": False, "error": f"Buy must be greater than 0 and no more than {settings.max_buy_sol} SOL."}
+    try:
+        overview = await security.get_token_overview(mint)
+        if not overview.found or overview.price_usd <= 0:
+            return {"ok": False, "error": "No reliable live market price is available for this token."}
+
+        before = await wallet.get_token_balance(mint)
+        result = await buy_token(mint, sol_amount)
+        if not result.success:
+            return {"ok": False, "error": result.error or "Buy failed."}
+
+        after = await wallet.get_token_balance(mint)
+        token_delta = max(0.0, after - before)
+        if token_delta <= 0:
+            return {"ok": False, "error": "Buy confirmed but token balance did not increase; position was not recorded.", "signature": result.signature}
+
+        try:
+            decimals = (await wallet.client.get_token_supply(Pubkey.from_string(mint))).value.decimals
+        except Exception:
+            decimals = overview.decimals or 9
+
+        st = await store.get_settings()
+        old = (await store.get_positions()).get(mint)
+        snap = _snapshot(overview, source="dashboard", trade_amount=sol_amount)
+        if old:
+            total = old.amount_tokens + token_delta
+            old.entry_price_usd = ((old.entry_price_usd * old.amount_tokens) + (overview.price_usd * token_delta)) / total
+            old.amount_tokens = total
+            old.entry_sol = (old.entry_sol or 0) + sol_amount
+            old.decimals = decimals
+            old.entry_snapshot = {**(old.entry_snapshot or {}), "last_add": snap}
+            await store.upsert_position(old)
+        else:
+            pos = Position(
+                mint=mint,
+                symbol=overview.symbol,
+                entry_price_usd=overview.price_usd,
+                amount_tokens=token_delta,
+                decimals=decimals,
+                take_profit_pct=st.get("default_tp_pct"),
+                stop_loss_pct=st.get("default_sl_pct", 30.0),
+                entry_sol=sol_amount,
+                opened_at=time.time(),
+                buy_signature=result.signature,
+                entry_snapshot=snap,
+            )
+            await store.upsert_position(pos)
+
+        return {"ok": True, "signature": result.signature, "symbol": overview.symbol, "tokens": token_delta, "price_usd": overview.price_usd}
+    except Exception as exc:
+        log.exception("Dashboard buy failed: %s", type(exc).__name__)
+        return {"ok": False, "error": "Buy failed due to a temporary error."}
+
+
+async def dashboard_sell(mint: str, fraction) -> dict:
+    """Same close path as the Telegram flow (do_sell) — also saves closed trades to history."""
+    mint = (mint or "").strip()
+    try:
+        fraction = float(fraction)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "Invalid close percentage."}
+    if not wallet.configured:
+        return {"ok": False, "error": "No wallet connected."}
+    if not 0 < fraction <= 1:
+        return {"ok": False, "error": "Close percentage must be between 0.01% and 100%."}
+    try:
+        positions = await store.get_positions()
+        pos = positions.get(mint)
+        if not pos:
+            return {"ok": False, "error": "No recorded position for that token."}
+
+        wallet_balance = await wallet.get_token_balance(mint)
+        if wallet_balance <= 0:
+            await store.remove_position(mint)
+            return {"ok": False, "error": "Wallet shows zero token balance already — position cleared."}
+
+        sell_balance = min(wallet_balance, max(0.0, float(pos.amount_tokens or 0.0))) * fraction
+        raw_units = to_raw_units(sell_balance, pos.decimals)
+        if raw_units <= 0:
+            return {"ok": False, "error": "Close amount is too small for the token precision."}
+
+        result = await sell_token(mint, raw_units, pos.decimals)
+        if not result.success:
+            return {"ok": False, "error": result.error or "Sell failed."}
+
+        try:
+            ov = await security.get_token_overview(mint)
+            exit_price = ov.price_usd if ov.found else None
+        except Exception:
+            exit_price = None
+
+        close_event = {
+            "closed_at": time.time(),
+            "fraction": fraction,
+            "tokens": sell_balance,
+            "exit_price_usd": exit_price,
+            "sell_signature": result.signature,
+            "reason": "MANUAL_CLOSE_DASHBOARD",
+        }
+        pos.close_events = list(pos.close_events or []) + [close_event]
+
+        if fraction >= 0.999999:
+            pnl = await _save_closed_trade(pos, mint, result.signature, "MANUAL_CLOSE_DASHBOARD", exit_price, sell_balance)
+            await store.remove_position(mint)
+        else:
+            pnl = ((exit_price - pos.entry_price_usd) / pos.entry_price_usd * 100) if exit_price and pos.entry_price_usd else None
+            await store.upsert_position(pos)
+            await store.reduce_position_amount(mint, sell_balance)
+
+        return {"ok": True, "signature": result.signature, "pnl_pct": pnl, "symbol": pos.symbol}
+    except Exception as exc:
+        log.exception("Dashboard sell failed: %s", type(exc).__name__)
+        return {"ok": False, "error": "Sell failed due to a temporary error."}
+
+
+async def dashboard_wallet_snapshot() -> dict:
+    """Balance + USD price, used by the dashboard's stat cards."""
+    if not wallet.configured:
+        return {"connected": False}
+    try:
+        bal = await wallet.get_sol_balance()
+    except Exception:
+        return {"connected": True, "balance_sol": None, "balance_usd": None, "sol_usd_price": None}
+    try:
+        usd_price = await wallet.get_sol_usd_price()
+    except Exception:
+        usd_price = None
+    return {
+        "connected": True,
+        "balance_sol": bal,
+        "sol_usd_price": usd_price,
+        "balance_usd": (bal * usd_price) if usd_price is not None else None,
+    }
+
+
+async def dashboard_positions_snapshot() -> dict:
+    """Live price per open position mint, used to compute PnL/value on the dashboard."""
+    positions = await store.get_positions()
+    out: dict[str, dict] = {}
+    for mint in positions:
+        try:
+            ov = await security.get_token_overview(mint)
+            out[mint] = {"price_usd": ov.price_usd if ov.found else None}
+        except Exception:
+            out[mint] = {"price_usd": None}
+    return out
+
+
 async def smart_sl_daemon(context: ContextTypes.DEFAULT_TYPE):
     # Runs on its own fast interval (SMART_SL_POLL_SECONDS, default 1s) so an
     # open position's exits (hard SL, velocity panic, moonbag, ratchet) are
@@ -677,6 +907,7 @@ def main():
     # its own slower interval, so it stays on a separate job.
     app.job_queue.run_repeating(smart_sl_daemon, interval=settings.smart_sl_poll_seconds, first=5)
     app.job_queue.run_repeating(sniper_daemon, interval=settings.auto_sniper_poll_seconds, first=10)
+    app.job_queue.run_once(_capture_event_loop, when=0)
     log.info("Bot starting — whitelisted admins: %s", settings.admin_ids)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
