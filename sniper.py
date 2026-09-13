@@ -42,7 +42,11 @@ def _record(mint: str, symbol: str | None, verdict: str, reason: str, **extra):
         del _activity_log[: len(_activity_log) - _ACTIVITY_LIMIT]
 
 
-def _analysis_snapshot(overview, rug=None, analysis=None) -> dict:
+def _fnum(v, fmt: str = ".1f") -> str:
+    """Format a possibly-None numeric value for a check detail string."""
+    return "?" if v is None else format(v, fmt)
+
+
     """The actual analyze_token() output for one candidate, in the same
     shape shown to the dashboard -- so the activity feed shows WHAT was
     analyzed, not just the one-line pass/fail reason."""
@@ -468,72 +472,93 @@ async def tick(context) -> None:
             try:
                 overview, rug, analysis = await analyze_token(mint)
                 symbol = overview.symbol or None
-                if not overview.found or overview.price_usd <= 0:
-                    _record(mint, symbol, "SKIPPED", "No market data / price found", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if overview.data_quality != "HIGH":
-                    log.info("Auto-sniper blocked %s: data quality=%s warnings=%s", mint, overview.data_quality, overview.data_warnings)
-                    _record(mint, symbol, "SKIPPED", f"Data quality {overview.data_quality} (warnings: {', '.join(overview.data_warnings) or 'none'})", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if overview.market_cap <= 0 or overview.total_supply <= 0 or overview.fdv <= 0:
-                    _record(mint, symbol, "SKIPPED", "Missing market cap / supply / FDV data", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if not rug.mint_authority_revoked or not rug.freeze_authority_revoked:
-                    _record(mint, symbol, "SKIPPED", "Mint or freeze authority not revoked (rug risk)", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if rug.top_holder_pct is None or rug.top_holder_pct > 10:
-                    _record(mint, symbol, "SKIPPED", f"Top holder concentration {rug.top_holder_pct if rug.top_holder_pct is not None else '?'}% (max 10%)", **_analysis_snapshot(overview, rug, analysis))
-                    continue
 
-                liquidity = overview.liquidity_usd
-                market_cap = overview.market_cap
-                volume_5m = overview.volume_5m
+                # Evaluate every gate up front instead of stopping at the
+                # first failure, so the dashboard can show which checks
+                # passed (green) and which failed (red) for every single
+                # candidate -- not just the one reason it happened to trip
+                # on first.
+                checks: list[dict] = []
+
+                def add_check(label: str, passed: bool, detail: str):
+                    checks.append({"label": label, "passed": bool(passed), "detail": detail})
+
+                found_ok = bool(overview.found) and overview.price_usd > 0
+                add_check("Market data found", found_ok, "found" if found_ok else "No market data / price found")
+
+                data_quality_ok = overview.data_quality == "HIGH"
+                add_check(
+                    "Data quality", data_quality_ok,
+                    f"{overview.data_quality}" + (f" (warnings: {', '.join(overview.data_warnings)})" if overview.data_warnings else ""),
+                )
+
+                mcap_data_ok = (overview.market_cap or 0) > 0 and (overview.total_supply or 0) > 0 and (overview.fdv or 0) > 0
+                add_check("Market cap / supply / FDV present", mcap_data_ok, "present" if mcap_data_ok else "missing")
+
+                authority_ok = bool(rug.mint_authority_revoked) and bool(rug.freeze_authority_revoked)
+                add_check("Mint/Freeze authority revoked", authority_ok, "revoked" if authority_ok else "NOT revoked (rug risk)")
+
+                holder_ok = rug.top_holder_pct is not None and rug.top_holder_pct <= 10
+                add_check("Top holder concentration", holder_ok, f"{_fnum(rug.top_holder_pct)}% (max 10%)")
+
+                liquidity = overview.liquidity_usd or 0
+                liquidity_ok = liquidity >= settings.auto_sniper_min_liquidity_usd
+                add_check("Liquidity", liquidity_ok, f"${liquidity:,.0f} (min ${settings.auto_sniper_min_liquidity_usd:,.0f})")
+
+                market_cap = overview.market_cap or 0
+                mc_ok = market_cap >= settings.auto_sniper_min_market_cap_usd
+                add_check("Market cap", mc_ok, f"${market_cap:,.0f} (min ${settings.auto_sniper_min_market_cap_usd:,.0f})")
+
+                volume_5m = overview.volume_5m or 0
+                vol_ok = volume_5m >= settings.auto_sniper_min_volume_5m_usd
+                add_check("5m volume", vol_ok, f"${volume_5m:,.0f} (min ${settings.auto_sniper_min_volume_5m_usd:,.0f})")
+
+                liq_mcap_pct = overview.liquidity_mcap_pct or 0
+                liq_mcap_ok = liq_mcap_pct >= settings.auto_sniper_min_liquidity_mcap_pct
+                add_check("Liquidity/MC ratio", liq_mcap_ok, f"{liq_mcap_pct:.1f}% (min {settings.auto_sniper_min_liquidity_mcap_pct:.1f}%)")
+
                 change_5m = overview.change_5m
-                age = overview.age_minutes
-                ratio = overview.buy_sell_ratio_5m
-                trades_5m = overview.total_trades_5m
+                change_5m_ok = change_5m is not None and 0 < change_5m <= settings.auto_sniper_max_5m_change_pct
+                add_check("5m momentum", change_5m_ok, f"{_fnum(change_5m, '+.1f')}% (allowed 0–{settings.auto_sniper_max_5m_change_pct:.0f}%)")
 
-                if liquidity < settings.auto_sniper_min_liquidity_usd:
-                    _record(mint, symbol, "SKIPPED", f"Liquidity ${liquidity:,.0f} < min ${settings.auto_sniper_min_liquidity_usd:,.0f}", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if market_cap < settings.auto_sniper_min_market_cap_usd:
-                    _record(mint, symbol, "SKIPPED", f"Market cap ${market_cap:,.0f} < min ${settings.auto_sniper_min_market_cap_usd:,.0f}", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if volume_5m < settings.auto_sniper_min_volume_5m_usd:
-                    _record(mint, symbol, "SKIPPED", f"5m volume ${volume_5m:,.0f} < min ${settings.auto_sniper_min_volume_5m_usd:,.0f}", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if overview.liquidity_mcap_pct < settings.auto_sniper_min_liquidity_mcap_pct:
-                    _record(mint, symbol, "SKIPPED", f"Liquidity/MC {overview.liquidity_mcap_pct:.1f}% < min {settings.auto_sniper_min_liquidity_mcap_pct:.1f}%", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if change_5m <= 0 or change_5m > settings.auto_sniper_max_5m_change_pct:
-                    _record(mint, symbol, "SKIPPED", f"5m momentum {change_5m:+.1f}% outside allowed 0–{settings.auto_sniper_max_5m_change_pct:.0f}%", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if age is None or age < settings.auto_sniper_min_age_minutes or age > settings.auto_sniper_max_age_minutes:
-                    _record(mint, symbol, "SKIPPED", f"Pool age {age if age is not None else '?'}m outside {settings.auto_sniper_min_age_minutes:g}–{settings.auto_sniper_max_age_minutes:g}m window", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                # "Other side" of the strategy: a token old enough to have a
-                # real 1h history (as opposed to a fresh mint still being
-                # judged on 5m momentum alone) must also show a genuine 1h
-                # uptrend -- i.e. its market cap/price has actually been
-                # rising over the last hour, not just old and flat/dumping.
-                if age >= settings.auto_sniper_trend_check_age_minutes:
+                age = overview.age_minutes
+                age_ok = age is not None and settings.auto_sniper_min_age_minutes <= age <= settings.auto_sniper_max_age_minutes
+                add_check("Pool age", age_ok, f"{_fnum(age, '.0f')}m (window {settings.auto_sniper_min_age_minutes:g}–{settings.auto_sniper_max_age_minutes:g}m)")
+
+                # "Other side" of the strategy: only applies once a token is
+                # old enough to have a real 1h history -- not applicable
+                # (so not added to the list at all) for a fresh mint still
+                # being judged on 5m momentum alone.
+                if age is not None and age >= settings.auto_sniper_trend_check_age_minutes:
                     change_1h = overview.change_1h
-                    if change_1h is None or change_1h < settings.auto_sniper_min_1h_change_pct:
-                        _record(mint, symbol, "SKIPPED", f"1h trend {change_1h if change_1h is not None else '?'}% below min +{settings.auto_sniper_min_1h_change_pct:.0f}% (established token not currently trending up)", **_analysis_snapshot(overview, rug, analysis))
-                        continue
-                if trades_5m < 5:
-                    _record(mint, symbol, "SKIPPED", f"Only {trades_5m} trades in the last 5m (min 5)", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if overview.sells_5m > 0 and ratio < settings.auto_sniper_min_buy_sell_ratio:
-                    _record(mint, symbol, "SKIPPED", f"Buy/Sell ratio {ratio:.2f} < min {settings.auto_sniper_min_buy_sell_ratio:.2f}", **_analysis_snapshot(overview, rug, analysis))
-                    continue
-                if analysis.risk_score > settings.auto_sniper_max_risk_score or rug.risk_level != "LOW":
-                    _record(mint, symbol, "SKIPPED", f"Risk score {analysis.risk_score}/100 (max {settings.auto_sniper_max_risk_score}), RugCheck {rug.risk_level}", **_analysis_snapshot(overview, rug, analysis))
+                    trend_ok = change_1h is not None and change_1h >= settings.auto_sniper_min_1h_change_pct
+                    add_check("1h trend (established token)", trend_ok, f"{_fnum(change_1h, '+.1f')}% (min +{settings.auto_sniper_min_1h_change_pct:.0f}%)")
+
+                trades_5m = overview.total_trades_5m or 0
+                trades_ok = trades_5m >= 5
+                add_check("5m trade count", trades_ok, f"{trades_5m} (min 5)")
+
+                ratio = overview.buy_sell_ratio_5m
+                ratio_ok = not overview.sells_5m or (ratio is not None and ratio >= settings.auto_sniper_min_buy_sell_ratio)
+                add_check("Buy/Sell ratio", ratio_ok, f"{_fnum(ratio, '.2f')} (min {settings.auto_sniper_min_buy_sell_ratio:.2f})")
+
+                risk_ok = analysis.risk_score <= settings.auto_sniper_max_risk_score and rug.risk_level == "LOW"
+                add_check("Risk score / RugCheck", risk_ok, f"{analysis.risk_score}/100 (max {settings.auto_sniper_max_risk_score}), RugCheck {rug.risk_level}")
+
+                all_passed = all(c["passed"] for c in checks)
+                if not all_passed:
+                    first_fail = next(c for c in checks if not c["passed"])
+                    _record(
+                        mint, symbol, "SKIPPED",
+                        f"{first_fail['label']}: {first_fail['detail']}",
+                        checks=checks,
+                        **_analysis_snapshot(overview, rug, analysis),
+                    )
                     continue
 
                 current_positions = await store.get_positions()
                 if mint in current_positions or len(current_positions) >= settings.auto_sniper_max_positions:
-                    _record(mint, symbol, "SKIPPED", "Already holding this mint, or max concurrent positions reached", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "SKIPPED", "Already holding this mint, or max concurrent positions reached", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
 
                 # Recalculate immediately before quoting.
@@ -542,31 +567,31 @@ async def tick(context) -> None:
                 remaining_exposure = settings.auto_sniper_max_exposure_sol - await _auto_exposure_sol(current_positions)
                 trade_amount = min(trade_amount, remaining_exposure)
                 if trade_amount <= 0 or balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
-                    _record(mint, symbol, "SKIPPED", "Insufficient spendable SOL after fee reserve / exposure cap", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "SKIPPED", "Insufficient spendable SOL after fee reserve / exposure cap", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
 
                 # Safe exact lamports conversion
                 quote_lamports = to_raw_units(trade_amount, 9)
                 quote = await get_quote(SOL_MINT, mint, quote_lamports, settings.auto_sniper_slippage_bps)
                 if quote.price_impact_pct > settings.auto_sniper_max_price_impact_pct:
-                    _record(mint, symbol, "SKIPPED", f"Jupiter price impact {quote.price_impact_pct:.1f}% > max {settings.auto_sniper_max_price_impact_pct:.1f}%", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "SKIPPED", f"Jupiter price impact {quote.price_impact_pct:.1f}% > max {settings.auto_sniper_max_price_impact_pct:.1f}%", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
 
                 # One last balance check
                 available_sol_now, balance_now = await _available_trade_sol()
                 final_amount = min(available_sol_now * allocation_pct / 100.0, settings.max_buy_sol, remaining_exposure)
                 if final_amount <= 0 or balance_now - final_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
-                    _record(mint, symbol, "SKIPPED", "Balance changed before final check -- amount no longer affordable", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "SKIPPED", "Balance changed before final check -- amount no longer affordable", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
                 if abs(final_amount - trade_amount) > 1e-9:
-                    _record(mint, symbol, "SKIPPED", "Balance shifted between checks (safety abort, will retry)", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "SKIPPED", "Balance shifted between checks (safety abort, will retry)", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
 
                 before_balance = await wallet.get_token_balance(mint)
                 result = await buy_token(mint, final_amount, settings.auto_sniper_slippage_bps)
                 if not result.success:
                     log.warning("Auto-sniper buy failed for %s: %s", mint, result.error)
-                    _record(mint, symbol, "BUY_FAILED", result.error or "Unknown execution error", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "BUY_FAILED", result.error or "Unknown execution error", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     continue
 
                 try:
@@ -577,7 +602,7 @@ async def tick(context) -> None:
                 token_delta = max(0.0, after_balance - before_balance)
                 if token_delta <= 0:
                     log.error("Auto-buy confirmed but token balance delta is zero for %s", mint)
-                    _record(mint, symbol, "ERROR", "Buy confirmed but resulting balance could not be measured", **_analysis_snapshot(overview, rug, analysis))
+                    _record(mint, symbol, "ERROR", "Buy confirmed but resulting balance could not be measured", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                     await context.bot.send_message(next(iter(settings.admin_ids)), f"⚠️ Auto-buy confirmed for ${overview.symbol}, but position balance could not be measured. Tx: `{result.signature}`", parse_mode="Markdown")
                     return
 
@@ -597,7 +622,7 @@ async def tick(context) -> None:
                 )
                 await store.upsert_position(pos)
                 _last_buy_at = time.time()
-                _record(mint, symbol, "BOUGHT", f"Spent {final_amount:.4f} SOL @ ${overview.price_usd:.10f}", **_analysis_snapshot(overview, rug, analysis))
+                _record(mint, symbol, "BOUGHT", f"Spent {final_amount:.4f} SOL @ ${overview.price_usd:.10f}", checks=checks, **_analysis_snapshot(overview, rug, analysis))
                 await context.bot.send_message(
                     next(iter(settings.admin_ids)),
                     f"🤖 *AUTO-SNIPER BUY — POSITION OPEN*\n\n"

@@ -112,6 +112,10 @@ code{font-size:10px;word-break:break-all}
 nav.tabs{margin:14px 0 22px;display:flex;gap:8px}
 nav.tabs a{padding:8px 16px;border-radius:10px;text-decoration:none;font-weight:700;font-size:13px;color:#8993a5;background:#141821;border:1px solid #252c3a}
 nav.tabs a.active{color:#e9edf5;border-color:#3a4356;background:#1a2029}
+.checklist{display:flex;flex-direction:column;gap:3px;min-width:170px}
+.chk{display:block;font-size:10.5px;padding:2px 6px;border-radius:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.chk-pass{background:#123a21;color:#52d273}
+.chk-fail{background:#3a1414;color:#ef6a6a}
 """
 
 _JS_COMMON = """
@@ -162,7 +166,7 @@ def _page_tokens() -> bytes:
 
 <h2>🎯 Auto-Sniper activity <span class="small" id="sniperMeta"></span></h2>
 <div class="small">Every token the sniper looks at is listed below with the exact reason it passed or was skipped — updated live. System/error messages are on the <a href="/logs" style="color:#e9edf5">Logs</a> page.</div><br>
-<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th><th>Price</th><th>Liquidity</th><th>MC</th><th>5m Vol</th><th>5m Δ</th><th>Age</th><th>Risk</th><th>RugCheck</th></tr></thead><tbody id="activityBody"><tr><td colspan="13" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th><th>Price</th><th>Liquidity</th><th>MC</th><th>5m Vol</th><th>5m Δ</th><th>Age</th><th>Risk</th><th>RugCheck</th><th>Checks</th></tr></thead><tbody id="activityBody"><tr><td colspan="14" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
 
 <h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br>
 <table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody id="posBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table>
@@ -178,6 +182,15 @@ def _page_tokens() -> bytes:
 function num(v, digits, prefix, suffix){{
   if(v==null) return '—';
   return (prefix||'') + Number(v).toLocaleString(undefined,{{minimumFractionDigits:digits,maximumFractionDigits:digits}}) + (suffix||'');
+}}
+function renderChecks(checks){{
+  if(!checks || !checks.length) return '—';
+  return '<div class="checklist">' + checks.map(c => {{
+    const cls = c.passed ? 'chk-pass' : 'chk-fail';
+    const mark = c.passed ? '✓' : '✕';
+    const title = esc(c.label + ': ' + c.detail);
+    return `<span class="chk ${{cls}}" title="${{title}}">${{mark}} ${{esc(c.label)}}</span>`;
+  }}).join('') + '</div>';
 }}
 function render(s){{
   document.getElementById('demoBanner').innerHTML = s.paper_trading
@@ -205,8 +218,9 @@ function render(s){{
     <td>${{num(a.liquidity_usd,0,'$')}}</td><td>${{num(a.market_cap_usd,0,'$')}}</td>
     <td>${{num(a.volume_5m_usd,0,'$')}}</td><td>${{a.change_5m_pct!=null? num(a.change_5m_pct,1,'',' %'):'—'}}</td>
     <td>${{a.age_minutes!=null? Math.round(a.age_minutes)+'m':'—'}}</td>
-    <td>${{a.risk_score!=null? a.risk_score+'/100':'—'}}</td><td>${{esc(a.rug_level||'—')}}</td></tr>`
-  ).join('') : '<tr><td colspan="13" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
+    <td>${{a.risk_score!=null? a.risk_score+'/100':'—'}}</td><td>${{esc(a.rug_level||'—')}}</td>
+    <td>${{renderChecks(a.checks)}}</td></tr>`
+  ).join('') : '<tr><td colspan="14" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
 
   document.getElementById('posBody').innerHTML = (s.positions && s.positions.length) ? s.positions.map(p => `
     <tr><td><b>${{esc(p.symbol||'?')}}</b></td><td><code>${{esc(p.mint||'')}}</code></td>
