@@ -1,11 +1,13 @@
 """JSON persistence for positions, trade history, and bot settings."""
 import asyncio
 import json
+import logging
 import os
 from dataclasses import asdict, dataclass, field
 
 from config import settings
 
+log = logging.getLogger("state")
 _lock = asyncio.Lock()
 
 
@@ -102,7 +104,19 @@ class StateStore:
             for mint, raw in self._data["positions"].items():
                 try:
                     positions[mint] = Position(**raw)
-                except TypeError:
+                except TypeError as exc:
+                    # Previously silent: a saved position that no longer
+                    # matches the current Position schema (extra/missing
+                    # field after a code update, or corrupted entry) just
+                    # vanished from every reader of get_positions() --
+                    # /positions in Telegram, the smart-SL daemon, and the
+                    # sniper's position-count check -- while the raw data
+                    # (and the SOL already spent on it) stayed on disk.
+                    # That looks exactly like "balance went down, buy
+                    # confirmed, but no position anywhere." Now it's at
+                    # least visible on the dashboard's Logs page instead of
+                    # disappearing without a trace.
+                    log.warning("Position for %s could not be loaded (schema mismatch: %s) -- raw entry kept on disk, not shown as an open position", mint, exc)
                     continue
             return positions
 

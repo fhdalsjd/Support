@@ -1,6 +1,7 @@
 """Quote + swap execution with preflight simulation and strict safety checks."""
 import asyncio
 import base64
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import security
 from config import settings
 from wallet import wallet, LAMPORTS_PER_SOL
 
+log = logging.getLogger("trading")
 SOL_MINT = "So11111111111111111111111111111111111111112"
 JITO_TIP_ACCOUNTS = [
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
@@ -151,6 +153,15 @@ async def _paper_fill(input_mint: str, output_mint: str, quote: QuoteResult) -> 
         decimals = overview.decimals if (overview.found and overview.decimals) else 9
         sol_spent = quote.in_amount / LAMPORTS_PER_SOL
         tokens_received = quote.out_amount / (10 ** decimals)
+        log.info(
+            "Paper buy fill %s: quote.out_amount=%s decimals=%s (overview.found=%s overview.decimals=%s) -> tokens_received=%s sol_spent=%s",
+            token_mint, quote.out_amount, decimals, overview.found, overview.decimals, tokens_received, sol_spent,
+        )
+        if tokens_received <= 0:
+            log.warning(
+                "Paper buy for %s will record ZERO tokens (quote.out_amount=%s) -- SOL will still be debited from the paper ledger since the swap itself 'succeeded', but no position will be created downstream. This usually means Jupiter had no real route/liquidity for this mint.",
+                token_mint, quote.out_amount,
+            )
         wallet.paper.apply_buy(token_mint, sol_spent, tokens_received)
     else:
         # Sell: token -> SOL.
@@ -184,6 +195,13 @@ async def execute_swap(
         return SwapResult(success=False, error=f"Jupiter network unavailable after retries: {type(e).__name__}")
     except Exception as e:
         return SwapResult(success=False, error=f"Quote error: {e}")
+
+    log.info(
+        "Swap quote %s -> %s: amount_lamports_in=%s out_amount=%s price_impact=%.2f%% route=%s",
+        input_mint, output_mint, amount_lamports, quote.out_amount, quote.price_impact_pct, quote.route_summary,
+    )
+    if quote.out_amount <= 0:
+        return SwapResult(success=False, error="Jupiter quote returned zero output for this amount -- there's likely no real route/liquidity for this token yet")
 
     if quote.price_impact_pct > 25:
         return SwapResult(success=False, error=f"Price impact too high ({quote.price_impact_pct:.1f}%), aborting")
