@@ -363,7 +363,7 @@ def _entry_snapshot(overview, rug, analysis, allocation_pct: float, trade_amount
         "volume_5m_usd": overview.volume_5m,
         "volume_24h_usd": overview.volume_24h,
         "trades_5m": overview.total_trades_5m,
-        "trades_24h": overview.total_trades_24h,
+        "trades_1h": overview.total_trades_1h,
         "buy_sell_ratio_5m": overview.buy_sell_ratio_5m,
         "change_5m_pct": overview.change_5m,
         "change_1h_pct": overview.change_1h,
