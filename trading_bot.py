@@ -417,7 +417,12 @@ async def do_buy(update: Update, context: ContextTypes.DEFAULT_TYPE, mint: str, 
         )
     except Exception as exc:
         log.exception("Buy failed: %s", type(exc).__name__)
-        await notice.edit_text("❌ Buy failed due to a temporary error. No wallet credential was exposed.")
+        # Plain text (no parse_mode) here on purpose: the exception message
+        # is arbitrary text that could itself contain Markdown special
+        # characters, and formatting it as Markdown risked a second,
+        # unrelated failure (a bad-entity error from Telegram) masking the
+        # actual diagnostic underneath.
+        await notice.edit_text(f"Buy failed due to a temporary error: {type(exc).__name__}: {str(exc)[:200]}\nNo wallet credential was exposed.")
 
 
 async def _positions_text_and_kb():
