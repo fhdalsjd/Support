@@ -164,16 +164,101 @@ async def _pumpfun_newest_coins() -> list[dict]:
     return out
 
 
+async def _pumpfun_about_to_graduate() -> list[dict]:
+    """Secondary pump.fun source: tokens nearing/at graduation to Raydium.
+
+    The newest-launch feed above catches mints seconds old -- almost all of
+    them still on the bonding curve with no real pool yet, so they get
+    SKIPPED for "Data quality LOW". pump.fun's own "king of the hill" feed
+    lists the coins with the most real trading activity on their bonding
+    curve, which is exactly the population closest to (or already past)
+    graduating to an actual Raydium pool with real liquidity. Same
+    unofficial-endpoint caveats as _pumpfun_newest_coins: any failure just
+    yields an empty list.
+    """
+    url = "https://frontend-api-v3.pump.fun/coins/king-of-the-hill"
+    params = {"offset": 0, "limit": 50, "includeNsfw": "false"}
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_BROWSER_HEADERS) as http:
+            r = await http.get(url, params=params)
+            if r.status_code != 200:
+                log.warning(
+                    "pump.fun king-of-the-hill feed returned HTTP %s: %s",
+                    r.status_code, r.text[:200].replace("\n", " "),
+                )
+                return []
+            data = r.json()
+    except Exception as exc:
+        log.warning("pump.fun king-of-the-hill feed unavailable: %s: %s", type(exc).__name__, exc)
+        return []
+
+    if isinstance(data, list):
+        coins = data
+    elif isinstance(data, dict):
+        coins = data.get("coins") or data.get("data") or []
+    else:
+        coins = []
+
+    out: list[dict] = []
+    for c in coins:
+        if not isinstance(c, dict):
+            continue
+        mint = c.get("mint") or c.get("tokenAddress") or c.get("address")
+        if mint:
+            out.append({"chainId": "solana", "tokenAddress": mint})
+    return out
+
+
+async def _dexscreener_boosted() -> list[dict]:
+    """Tertiary source: DexScreener's boosted-token feed. Projects pay to
+    boost, which in practice means they already have a real pool and are
+    pushing for visibility -- a different population again from brand-new
+    or about-to-graduate pump.fun mints, and a cheap way to widen coverage
+    beyond pump.fun specifically."""
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_BROWSER_HEADERS) as http:
+            r = await http.get("https://api.dexscreener.com/token-boosts/latest/v1")
+            if r.status_code != 200:
+                log.warning(
+                    "DexScreener boosts feed returned HTTP %s: %s",
+                    r.status_code, r.text[:200].replace("\n", " "),
+                )
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        log.warning("DexScreener boosts feed unavailable: %s: %s", type(exc).__name__, exc)
+        return []
+
+
 async def _discover_candidates() -> list[dict]:
     """Merge every discovery source and de-duplicate by mint. Each source
     fails independently -- one going down (or pump.fun changing its API)
-    never blocks the other from surfacing candidates."""
-    pumpfun_batch, dexscreener_batch = await asyncio.gather(
-        _pumpfun_newest_coins(), _latest_profiles(), return_exceptions=True
+    never blocks the others from surfacing candidates.
+
+    Four sources, deliberately covering different populations:
+      - pump.fun newest: seconds-old mints (mostly pre-liquidity, filtered
+        out downstream by the data-quality gate -- but this is the only
+        source that ever sees a token in its first minutes at all)
+      - pump.fun king-of-the-hill: bonding-curve coins with heavy trading,
+        closest to (or already past) graduating to a real Raydium pool
+      - DexScreener profiles: tokens with a creator-submitted profile
+      - DexScreener boosts: tokens whose project paid to boost visibility
+    """
+    pumpfun_new, pumpfun_koth, dex_profiles, dex_boosts = await asyncio.gather(
+        _pumpfun_newest_coins(), _pumpfun_about_to_graduate(),
+        _latest_profiles(), _dexscreener_boosted(),
+        return_exceptions=True,
     )
     seen: set[str] = set()
     merged: list[dict] = []
-    for source_name, batch in (("pump.fun", pumpfun_batch), ("dexscreener", dexscreener_batch)):
+    sources = (
+        ("pump.fun-newest", pumpfun_new),
+        ("pump.fun-koth", pumpfun_koth),
+        ("dexscreener-profiles", dex_profiles),
+        ("dexscreener-boosts", dex_boosts),
+    )
+    for source_name, batch in sources:
         if isinstance(batch, Exception):
             log.warning("Auto-sniper discovery source (%s) failed: %s: %s", source_name, type(batch).__name__, batch)
             continue
@@ -184,9 +269,8 @@ async def _discover_candidates() -> list[dict]:
             seen.add(mint)
             merged.append(profile)
     log.info(
-        "Auto-sniper discovery: pump.fun=%d dexscreener=%d merged_unique=%d",
-        len(pumpfun_batch) if isinstance(pumpfun_batch, list) else -1,
-        len(dexscreener_batch) if isinstance(dexscreener_batch, list) else -1,
+        "Auto-sniper discovery: pump.fun-newest=%d pump.fun-koth=%d dexscreener-profiles=%d dexscreener-boosts=%d merged_unique=%d",
+        *(len(b) if isinstance(b, list) else -1 for _, b in sources),
         len(merged),
     )
     return merged
