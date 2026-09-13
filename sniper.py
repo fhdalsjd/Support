@@ -47,6 +47,7 @@ def _fnum(v, fmt: str = ".1f") -> str:
     return "?" if v is None else format(v, fmt)
 
 
+def _analysis_snapshot(overview, rug=None, analysis=None) -> dict:
     """The actual analyze_token() output for one candidate, in the same
     shape shown to the dashboard -- so the activity feed shows WHAT was
     analyzed, not just the one-line pass/fail reason."""
