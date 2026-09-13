@@ -122,7 +122,7 @@ code{font-size:10px;word-break:break-all}
 
 <h2>🎯 Auto-Sniper activity <span class="small" id="sniperMeta"></span></h2>
 <div class="small">Every token the sniper looks at is listed below with the exact reason it passed or was skipped — updated live.</div><br>
-<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th></tr></thead><tbody id="activityBody"><tr><td colspan="5" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
+<div class="tablewrap"><table><thead><tr><th>Time</th><th>Token</th><th>Mint</th><th>Result</th><th>Reason</th><th>Price</th><th>Liquidity</th><th>MC</th><th>5m Vol</th><th>5m Δ</th><th>Age</th><th>Risk</th><th>RugCheck</th></tr></thead><tbody id="activityBody"><tr><td colspan="13" class="muted">Waiting for first scan…</td></tr></tbody></table></div>
 
 <h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br>
 <table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody id="posBody"><tr><td colspan="8" class="muted">Loading…</td></tr></tbody></table>
@@ -172,10 +172,19 @@ function render(s){
   const sn = s.sniper || {last_tick_at:null, last_tick_candidates_seen:0, activity:[]};
   document.getElementById('sniperMeta').textContent =
     `— last scan ${timeAgo(sn.last_tick_at)} · ${sn.last_tick_candidates_seen||0} candidates in that pass`;
+  function num(v, digits, prefix, suffix){
+    if(v==null) return '—';
+    return (prefix||'') + Number(v).toLocaleString(undefined,{minimumFractionDigits:digits,maximumFractionDigits:digits}) + (suffix||'');
+  }
   document.getElementById('activityBody').innerHTML = (sn.activity && sn.activity.length) ? sn.activity.map(a => `
     <tr><td>${timeAgo(a.time)}</td><td><b>${esc(a.symbol||'?')}</b></td><td><code>${esc(a.mint)}</code></td>
-    <td><span class="badge ${BADGE_CLASS[a.verdict]||'badge-skipped'}">${esc(a.verdict)}</span></td><td>${esc(a.reason)}</td></tr>`
-  ).join('') : '<tr><td colspan="5" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
+    <td><span class="badge ${BADGE_CLASS[a.verdict]||'badge-skipped'}">${esc(a.verdict)}</span></td><td>${esc(a.reason)}</td>
+    <td>${a.price_usd!=null? '$'+Number(a.price_usd).toFixed(10):'—'}</td>
+    <td>${num(a.liquidity_usd,0,'$')}</td><td>${num(a.market_cap_usd,0,'$')}</td>
+    <td>${num(a.volume_5m_usd,0,'$')}</td><td>${a.change_5m_pct!=null? num(a.change_5m_pct,1,'',' %'):'—'}</td>
+    <td>${a.age_minutes!=null? Math.round(a.age_minutes)+'m':'—'}</td>
+    <td>${a.risk_score!=null? a.risk_score+'/100':'—'}</td><td>${esc(a.rug_level||'—')}</td></tr>`
+  ).join('') : '<tr><td colspan="13" class="muted">No candidates scanned yet — sniper may be OFF, or still on its first pass.</td></tr>';
 
   document.getElementById('posBody').innerHTML = (s.positions && s.positions.length) ? s.positions.map(p => `
     <tr><td><b>$${esc(p.symbol||'?')}</b></td><td><code>${esc(p.mint||'')}</code></td>
