@@ -276,8 +276,19 @@ async def tick(context) -> None:
         trade_amount = min(available_sol * allocation_pct / 100.0, settings.max_buy_sol)
         if trade_amount <= 0:
             return
-        if await _auto_exposure_sol(positions) + trade_amount > settings.auto_sniper_max_exposure_sol:
+        # Cap to whatever exposure room is left, rather than aborting the
+        # whole tick outright. AUTO_SNIPER_MAX_EXPOSURE_SOL is a small hard
+        # safety ceiling (e.g. 0.03 SOL) while trade_amount here comes from
+        # allocation_pct of the wallet balance -- for any real balance,
+        # allocation-based sizing will almost always be *larger* than that
+        # ceiling. Previously this returned outright whenever that happened,
+        # which meant a normal allocation % (e.g. 65%) silently blocked
+        # every single tick before discovery ever ran, no matter how many
+        # good candidates existed.
+        remaining_exposure = settings.auto_sniper_max_exposure_sol - await _auto_exposure_sol(positions)
+        if remaining_exposure <= 0:
             return
+        trade_amount = min(trade_amount, remaining_exposure)
         if balance - trade_amount < settings.auto_fee_reserve_sol + settings.auto_safety_buffer_sol:
             return
 
