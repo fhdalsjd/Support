@@ -82,11 +82,35 @@ async def _latest_profiles() -> list[dict]:
     DexScreener profile. Kept as a fallback, but most brand-new pump.fun
     mints never have a profile in their first hour, so this alone almost
     always returns an empty/near-empty list -- see _pumpfun_newest_coins."""
-    async with httpx.AsyncClient(timeout=10) as http:
-        r = await http.get("https://api.dexscreener.com/token-profiles/latest/v1")
-        r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else []
+    try:
+        async with httpx.AsyncClient(timeout=10, headers=_BROWSER_HEADERS) as http:
+            r = await http.get("https://api.dexscreener.com/token-profiles/latest/v1")
+            if r.status_code != 200:
+                log.warning(
+                    "DexScreener profiles feed returned HTTP %s: %s",
+                    r.status_code, r.text[:200].replace("\n", " "),
+                )
+                return []
+            data = r.json()
+            return data if isinstance(data, list) else []
+    except Exception as exc:
+        log.warning("DexScreener profiles feed unavailable: %s: %s", type(exc).__name__, exc)
+        return []
+
+
+_BROWSER_HEADERS = {
+    # pump.fun's frontend API sits behind Cloudflare and commonly 403s
+    # plain server-side requests with no browser-like headers -- this is
+    # very likely why the feed was silently empty even after switching
+    # sources.
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json",
+    "Referer": "https://pump.fun/",
+    "Origin": "https://pump.fun",
+}
 
 
 async def _pumpfun_newest_coins() -> list[dict]:
@@ -97,7 +121,9 @@ async def _pumpfun_newest_coins() -> list[dict]:
     which is exactly the population a sniper needs to see. This hits an
     unofficial/undocumented pump.fun endpoint, so it's wrapped defensively:
     any failure or shape change just yields an empty list and the tick
-    falls back to whatever DexScreener returned.
+    falls back to whatever DexScreener returned. Failures are logged at
+    WARNING (not DEBUG) so they actually surface in the dashboard's Live
+    Logs panel, which only mirrors INFO and above.
     """
     url = "https://frontend-api-v3.pump.fun/coins"
     params = {
@@ -108,12 +134,17 @@ async def _pumpfun_newest_coins() -> list[dict]:
         "includeNsfw": "false",
     }
     try:
-        async with httpx.AsyncClient(timeout=10) as http:
+        async with httpx.AsyncClient(timeout=10, headers=_BROWSER_HEADERS) as http:
             r = await http.get(url, params=params)
-            r.raise_for_status()
+            if r.status_code != 200:
+                log.warning(
+                    "pump.fun newest-coins feed returned HTTP %s: %s",
+                    r.status_code, r.text[:200].replace("\n", " "),
+                )
+                return []
             data = r.json()
     except Exception as exc:
-        log.debug("pump.fun newest-coins feed unavailable: %s", type(exc).__name__)
+        log.warning("pump.fun newest-coins feed unavailable: %s: %s", type(exc).__name__, exc)
         return []
 
     if isinstance(data, list):
@@ -137,14 +168,14 @@ async def _discover_candidates() -> list[dict]:
     """Merge every discovery source and de-duplicate by mint. Each source
     fails independently -- one going down (or pump.fun changing its API)
     never blocks the other from surfacing candidates."""
-    results = await asyncio.gather(
+    pumpfun_batch, dexscreener_batch = await asyncio.gather(
         _pumpfun_newest_coins(), _latest_profiles(), return_exceptions=True
     )
     seen: set[str] = set()
     merged: list[dict] = []
-    for batch in results:
+    for source_name, batch in (("pump.fun", pumpfun_batch), ("dexscreener", dexscreener_batch)):
         if isinstance(batch, Exception):
-            log.warning("Auto-sniper discovery source failed: %s", type(batch).__name__)
+            log.warning("Auto-sniper discovery source (%s) failed: %s: %s", source_name, type(batch).__name__, batch)
             continue
         for profile in batch:
             mint = profile.get("tokenAddress")
@@ -152,6 +183,12 @@ async def _discover_candidates() -> list[dict]:
                 continue
             seen.add(mint)
             merged.append(profile)
+    log.info(
+        "Auto-sniper discovery: pump.fun=%d dexscreener=%d merged_unique=%d",
+        len(pumpfun_batch) if isinstance(pumpfun_batch, list) else -1,
+        len(dexscreener_batch) if isinstance(dexscreener_batch, list) else -1,
+        len(merged),
+    )
     return merged
 
 
