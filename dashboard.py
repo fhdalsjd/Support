@@ -9,6 +9,8 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
+import live_logs
+
 BOT = None
 STARTED_AT = time.time()
 
@@ -75,6 +77,7 @@ def _status() -> dict:
         "positions": [{"mint": m, **p} for m, p in positions.items()],
         "history": history[:50], "uptime_seconds": int(time.time() - STARTED_AT),
         "sniper": _sniper_activity(),
+        "logs": live_logs.get_recent(150),
     }
 
 
@@ -102,6 +105,11 @@ code{font-size:10px;word-break:break-all}
 .badge-skipped{background:#241f0a;color:#e0b84d}
 .badge-error{background:#3a1414;color:#ef6a6a}
 .badge-buyfailed{background:#3a1414;color:#ef6a6a}
+.lvl-INFO{color:#8993a5}
+.lvl-WARNING{color:#e0b84d}
+.lvl-ERROR{color:#ef6a6a}
+.lvl-CRITICAL{color:#ef6a6a;font-weight:700}
+.logmsg{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;white-space:pre-wrap;word-break:break-word}
 .pulse{display:inline-block;width:9px;height:9px;border-radius:50%;background:#52d273;margin-right:6px;animation:pulse 1.4s infinite}
 @keyframes pulse{0%{opacity:1}50%{opacity:.25}100%{opacity:1}}
 </style></head><body><main>
@@ -122,6 +130,10 @@ code{font-size:10px;word-break:break-all}
 <h2>📚 Closed trade history</h2>
 <table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody id="histBody"><tr><td colspan="7" class="muted">Loading…</td></tr></tbody></table>
 
+<h2>📜 Live logs <span class="small" id="logsMeta"></span></h2>
+<div class="small">Same messages as the server/Railway logs, streamed here so you don't need to leave the dashboard.</div><br>
+<div class="tablewrap" id="logsWrap"><table><thead><tr><th style="width:90px">Time</th><th style="width:70px">Level</th><th style="width:110px">Source</th><th>Message</th></tr></thead><tbody id="logsBody"><tr><td colspan="4" class="muted">No log records yet.</td></tr></tbody></table></div>
+
 <div class="note"><b>Trade journal</b><br>Each completed trade keeps its entry snapshot, contract address, market/security data, entry and exit prices, close reason, peak/Smart-SL state, and buy/sell transaction signatures. The history is capped at 500 records and stored atomically in the bot state file.</div>
 <p class="small">No private key or recovery phrase is displayed.</p>
 
@@ -138,6 +150,7 @@ function timeAgo(sec){
   if(d<3600) return Math.floor(d/60)+'m ago';
   return Math.floor(d/3600)+'h ago';
 }
+function fmtClock(sec){ return sec==null ? '—' : new Date(sec*1000).toLocaleTimeString(); }
 const BADGE_CLASS = {BOUGHT:'badge-bought', SKIPPED:'badge-skipped', ERROR:'badge-error', BUY_FAILED:'badge-buyfailed'};
 
 function render(s){
@@ -176,6 +189,13 @@ function render(s){
     <td>$${Number(h.entry_price_usd||0).toFixed(8)}</td><td>$${Number(h.exit_price_usd||0).toFixed(8)}</td>
     <td><b>${fmtPnl(h.pnl_pct)}</b></td><td>${esc(h.close_reason||'—')}</td><td><code>${esc(h.sell_signature||'')}</code></td></tr>`
   ).join('') : '<tr><td colspan="7" class="muted">No closed trades yet</td></tr>';
+
+  const logs = s.logs || [];
+  document.getElementById('logsMeta').textContent = logs.length ? `— ${logs.length} recent entries` : '';
+  document.getElementById('logsBody').innerHTML = logs.length ? logs.map(l => `
+    <tr><td>${fmtClock(l.time)}</td><td class="lvl-${esc(l.level)}">${esc(l.level)}</td>
+    <td>${esc(l.logger)}</td><td class="logmsg">${esc(l.message)}</td></tr>`
+  ).join('') : '<tr><td colspan="4" class="muted">No log records yet.</td></tr>';
 
   document.getElementById('t').textContent = new Date().toLocaleTimeString();
 }

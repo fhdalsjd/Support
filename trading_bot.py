@@ -25,9 +25,11 @@ from trading import buy_token, sell_token, to_raw_units
 from wallet import wallet
 import sniper
 import smart_sl
+import live_logs
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("membot")
+live_logs.install(logging.INFO)
 
 MINT_RE = re.compile(r"(?<![1-9A-HJ-NP-Za-km-z])[1-9A-HJ-NP-Za-km-z]{32,44}(?![1-9A-HJ-NP-Za-km-z])")
 ZERO_WIDTH_RE = re.compile(r"[​‌‍﻿]")
