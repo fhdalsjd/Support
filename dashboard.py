@@ -58,14 +58,16 @@ def _status() -> dict:
     wallet = getattr(BOT, "wallet", None)
     settings = getattr(BOT, "settings", None)
     wallet_connected = bool(wallet and wallet.configured)
+    paper_trading = bool(getattr(settings, "paper_trading", False))
     address = None
     if wallet_connected:
         try:
-            address = str(wallet.pubkey)
+            address = wallet.short_address()
         except Exception:
             pass
     return {
         "service": "online", "bot_loaded": bool(BOT), "wallet_connected": wallet_connected,
+        "paper_trading": paper_trading,
         "wallet_address": address, "auto_sniper_enabled": bool(state.get("auto_sniper_enabled", False)),
         "auto_sniper_allocation_pct": state.get("auto_sniper_allocation_pct"),
         "slippage_bps": state.get("slippage_bps", getattr(settings, "default_slippage_bps", 500)),
@@ -108,6 +110,7 @@ def _page() -> bytes:
 body{{margin:0;background:#0b0d12;color:#e9edf5;font:15px system-ui,-apple-system,sans-serif}}main{{max-width:1400px;margin:auto;padding:24px}}h1{{margin:0 0 6px}}h2{{margin-top:28px}}.muted{{color:#8993a5}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:20px 0}}.card{{background:#141821;border:1px solid #252c3a;border-radius:14px;padding:16px}}.value{{font-size:22px;font-weight:700;margin-top:8px}}.ok{{color:#52d273}}table{{width:100%;border-collapse:collapse;background:#141821;border-radius:14px;overflow:hidden}}th,td{{padding:11px;border-bottom:1px solid #252c3a;text-align:left;font-size:12px;vertical-align:top}}th{{color:#9da7b8}}code{{font-size:10px;word-break:break-all}}.note{{background:#17130a;border:1px solid #4d3b13;padding:14px;border-radius:12px;margin-top:18px}}.small{{font-size:12px;color:#8993a5}}
 </style></head><body><main>
 <h1>Solana Trading Bot</h1><div class="muted">Live Railway service dashboard · refreshes every 5 seconds</div>
+{'<div class="note" style="background:#0a1f14;border-color:#1f4d2f"><b>🧪 DEMO MODE</b> — balances and trades below are simulated. No real funds, no real transactions.</div>' if s.get("paper_trading") else ''}
 <div class="grid"><div class="card"><div class="muted">Service</div><div class="value ok">ONLINE</div></div><div class="card"><div class="muted">Bot</div><div class="value">{"RUNNING" if s["bot_loaded"] else "OFFLINE"}</div></div><div class="card"><div class="muted">Wallet</div><div class="value">{wallet_text}</div><div class="small">{html.escape(wallet_addr)}</div></div><div class="card"><div class="muted">Auto-Sniper</div><div class="value">{sniper}</div><div class="small">Allocation: {allocation}</div></div><div class="card"><div class="muted">Open positions</div><div class="value">{len(s["positions"])}</div></div><div class="card"><div class="muted">Closed history</div><div class="value">{len(s["history"])}</div></div></div>
 <h2>🟢 Open positions</h2><div class="small">No fixed TP. Positions use -30% hard protection, +5% break-even, then a ratcheting profit lock at 50% of peak profit.</div><br><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Amount</th><th>TP</th><th>Hard SL</th><th>Smart SL</th><th>Peak PnL</th></tr></thead><tbody>{pos_rows}</tbody></table>
 <h2>📚 Closed trade history</h2><table><thead><tr><th>Token</th><th>CA / Mint</th><th>Entry</th><th>Exit</th><th>PnL</th><th>Reason</th><th>Sell Tx</th></tr></thead><tbody>{hist_rows}</tbody></table>

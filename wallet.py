@@ -3,9 +3,17 @@
 Wallet credentials supplied through Telegram are kept in memory only. The
 incoming Telegram message can be deleted after validation; the secret is
 never written to state.json or logged.
+
+Demo / paper trading (PAPER_TRADING=true): no real keypair is required and
+no RPC call ever touches a real balance. SOL/token balances are tracked in
+a small local JSON ledger (see PaperLedger below) that trading.py updates
+after every simulated fill.
 """
 import base58
+import json
 import logging
+import os
+import threading
 import httpx
 from bip_utils import Bip39SeedGenerator, Bip44, Bip44Coins, Bip44Changes
 from solders.keypair import Keypair
@@ -51,13 +59,72 @@ def load_keypair() -> Keypair | None:
     return None
 
 
+class PaperLedger:
+    """JSON-backed simulated balance for PAPER_TRADING mode. No real funds,
+    no real RPC calls -- trading.py writes into this after every simulated
+    fill so positions/PnL/dashboard all work exactly like live trading."""
+
+    def __init__(self):
+        base, _ext = os.path.splitext(settings.state_file or "./state.json")
+        self.path = f"{base}.paper.json"
+        self._lock = threading.Lock()
+        self.sol_balance = settings.paper_starting_balance_sol
+        self.token_balances: dict[str, float] = {}
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.path):
+            self._save()
+            return
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.sol_balance = float(data.get("sol_balance", settings.paper_starting_balance_sol))
+            self.token_balances = {k: float(v) for k, v in (data.get("token_balances") or {}).items()}
+        except Exception as exc:
+            log.warning("Could not read paper ledger (%s), starting fresh", type(exc).__name__)
+            self.sol_balance = settings.paper_starting_balance_sol
+            self.token_balances = {}
+
+    def _save(self):
+        tmp = f"{self.path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"sol_balance": self.sol_balance, "token_balances": self.token_balances}, f)
+        os.replace(tmp, self.path)
+
+    def apply_buy(self, mint: str, sol_spent: float, tokens_received: float):
+        with self._lock:
+            self.sol_balance = max(0.0, self.sol_balance - sol_spent)
+            self.token_balances[mint] = self.token_balances.get(mint, 0.0) + tokens_received
+            self._save()
+
+    def apply_sell(self, mint: str, tokens_sold: float, sol_received: float):
+        with self._lock:
+            remaining = max(0.0, self.token_balances.get(mint, 0.0) - tokens_sold)
+            if remaining <= 1e-9:
+                self.token_balances.pop(mint, None)
+            else:
+                self.token_balances[mint] = remaining
+            self.sol_balance += sol_received
+            self._save()
+
+    def reset(self):
+        with self._lock:
+            self.sol_balance = settings.paper_starting_balance_sol
+            self.token_balances = {}
+            self._save()
+
+
 class Wallet:
     def __init__(self):
         self.keypair: Keypair | None = None
         self.pubkey: Pubkey | None = None
         self.client: AsyncClient | None = None
         self.last_error: str | None = None
-        self._load_from_environment()
+        self.paper_mode = settings.paper_trading
+        self.paper: PaperLedger | None = PaperLedger() if self.paper_mode else None
+        if not self.paper_mode:
+            self._load_from_environment()
 
     def _load_from_environment(self):
         if settings.wallet_mnemonic:
@@ -77,6 +144,10 @@ class Wallet:
 
     @property
     def configured(self) -> bool:
+        # Demo mode needs no real credential -- the paper ledger is always
+        # ready the moment the process starts.
+        if self.paper_mode:
+            return True
         return self.keypair is not None and self.pubkey is not None and self.client is not None
 
     def connect_mnemonic(self, mnemonic: str) -> str:
@@ -113,11 +184,15 @@ class Wallet:
             raise RuntimeError("No wallet connected. Use /connect_wallet to connect a wallet.")
 
     def short_address(self) -> str:
+        if self.paper_mode:
+            return "DEMO-PAPER-WALLET"
         self._require_configured()
         s = str(self.pubkey)
         return f"{s[:4]}...{s[-4:]}"
 
     async def get_sol_balance(self) -> float:
+        if self.paper_mode:
+            return self.paper.sol_balance
         self._require_configured()
         resp = await self.client.get_balance(self.pubkey, commitment=Confirmed)
         return resp.value / LAMPORTS_PER_SOL
@@ -141,6 +216,8 @@ class Wallet:
             return float(value)
 
     async def get_token_balance(self, mint: str) -> float:
+        if self.paper_mode:
+            return self.paper.token_balances.get(mint, 0.0)
         self._require_configured()
         # solana-py's get_token_accounts_by_owner_json_parsed requires a real
         # TokenAccountOpts (it reads .mint / .program_id / .data_slice off

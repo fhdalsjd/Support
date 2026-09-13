@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import re
+import uuid
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR
 
@@ -11,6 +12,7 @@ from solders.pubkey import Pubkey
 from solders.system_program import TransferParams, transfer
 from solders.message import MessageV0
 
+import security
 from config import settings
 from wallet import wallet, LAMPORTS_PER_SOL
 
@@ -136,6 +138,31 @@ def _insufficient_balance_message(current_lamports: int, diagnostic: str) -> str
     )
 
 
+async def _paper_fill(input_mint: str, output_mint: str, quote: QuoteResult) -> SwapResult:
+    """Apply a simulated fill to the paper ledger using the REAL quote we
+    just fetched (so price/slippage/impact match live trading), instead of
+    building/signing/sending an actual transaction."""
+    fake_sig = f"PAPER-{uuid.uuid4().hex[:20]}"
+    if input_mint == SOL_MINT:
+        # Buy: SOL -> token. Need the token's decimals to turn the quote's
+        # raw out_amount into a UI amount for the ledger.
+        token_mint = output_mint
+        overview = await security.get_token_overview(token_mint)
+        decimals = overview.decimals if (overview.found and overview.decimals) else 9
+        sol_spent = quote.in_amount / LAMPORTS_PER_SOL
+        tokens_received = quote.out_amount / (10 ** decimals)
+        wallet.paper.apply_buy(token_mint, sol_spent, tokens_received)
+    else:
+        # Sell: token -> SOL.
+        token_mint = input_mint
+        overview = await security.get_token_overview(token_mint)
+        decimals = overview.decimals if (overview.found and overview.decimals) else 9
+        tokens_sold = quote.in_amount / (10 ** decimals)
+        sol_received = quote.out_amount / LAMPORTS_PER_SOL
+        wallet.paper.apply_sell(token_mint, tokens_sold, sol_received)
+    return SwapResult(success=True, signature=fake_sig, in_amount=quote.in_amount, out_amount=quote.out_amount)
+
+
 async def execute_swap(
     input_mint: str,
     output_mint: str,
@@ -160,6 +187,9 @@ async def execute_swap(
 
     if quote.price_impact_pct > 25:
         return SwapResult(success=False, error=f"Price impact too high ({quote.price_impact_pct:.1f}%), aborting")
+
+    if settings.paper_trading:
+        return await _paper_fill(input_mint, output_mint, quote)
 
     try:
         tx = await build_swap_transaction(quote, priority_fee)

@@ -19,6 +19,11 @@ def _float(name: str, default: float) -> float:
     return float(v) if v else default
 
 
+def _bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    return v.strip().lower() in {"1", "true", "yes", "on"} if v else default
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -88,6 +93,16 @@ class Settings:
     rugcheck_api: str = os.getenv("RUGCHECK_API", "https://api.rugcheck.xyz/v1")
     state_file: str = os.getenv("STATE_FILE", "./state.json")
 
+    # Demo / paper trading. When true, NO real Solana transaction is ever
+    # built, signed, or sent -- buy/sell still fetch a REAL Jupiter quote
+    # (so price, slippage, and price-impact behave exactly like live
+    # trading), but the fill is applied to a local simulated SOL/token
+    # balance instead of on-chain. No wallet credential is required in this
+    # mode. Use this to validate the sniper + Smart-SL strategy against real
+    # market data before risking real funds.
+    paper_trading: bool = _bool("PAPER_TRADING", False)
+    paper_starting_balance_sol: float = _float("PAPER_STARTING_BALANCE_SOL", 5.0)
+
     def validate(self):
         errs = []
         if not self.telegram_token:
@@ -136,6 +151,8 @@ class Settings:
             errs.append("DEFAULT_SLIPPAGE_BPS must be between 1 and 5000")
         if self.max_buy_sol <= 0:
             errs.append("MAX_BUY_SOL must be > 0")
+        if self.paper_starting_balance_sol <= 0:
+            errs.append("PAPER_STARTING_BALANCE_SOL must be > 0")
         if errs:
             raise RuntimeError("Config errors:\n- " + "\n- ".join(errs))
 

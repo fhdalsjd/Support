@@ -185,6 +185,20 @@ async def disconnect_wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     await update.message.reply_text("🔌 Wallet disconnected from this bot process. The recovery phrase was not persisted.")
 
 
+@admin_only
+async def reset_demo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not settings.paper_trading:
+        await update.message.reply_text("⚠️ PAPER_TRADING is not enabled — this bot is running with a real wallet, nothing to reset.")
+        return
+    wallet.paper.reset()
+    for mint in list((await store.get_positions()).keys()):
+        await store.remove_position(mint)
+    await update.message.reply_text(
+        f"🧪 Demo wallet reset.\nBalance: `{settings.paper_starting_balance_sol:.4f} SOL`\nAll open demo positions were cleared (trade history was kept).",
+        parse_mode="Markdown",
+    )
+
+
 async def build_dashboard_text_and_kb():
     st = await store.get_settings()
     sniper_state = "🟢 ON" if st.get("auto_sniper_enabled") else "🔴 OFF"
@@ -197,7 +211,9 @@ async def build_dashboard_text_and_kb():
             wallet_line = f"🔑 Wallet: `{wallet.short_address()}` (balance unavailable)"
     else:
         wallet_line = "🔌 Wallet: `Not connected`"
+    demo_banner = "🧪 *DEMO MODE — simulated balance, no real funds/transactions*\n\n" if settings.paper_trading else ""
     text = (
+        f"{demo_banner}"
         "*Solana Trading Bot • Pro Dashboard*\n\n"
         f"{wallet_line}\n"
         f"🎯 Auto-Sniper: {sniper_state}\n"
@@ -650,6 +666,7 @@ def main():
     app.add_handler(CommandHandler("connect_wallet", connect_wallet_cmd))
     app.add_handler(CommandHandler("cancel_wallet", cancel_wallet_cmd))
     app.add_handler(CommandHandler("disconnect_wallet", disconnect_wallet_cmd))
+    app.add_handler(CommandHandler("reset_demo", reset_demo_cmd))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
